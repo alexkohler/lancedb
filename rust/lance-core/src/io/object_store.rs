@@ -826,7 +826,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             let mut retry_config = RetryConfig::default();
             retry_config.backoff = backoff_config;
             retry_config.max_retries = 10; // 10 default
-            retry_config.retry_timeout = std::time::Duration::from_secs(10 * 60); // 3 * 60s default
+            retry_config.retry_timeout = std::time::Duration::from_secs(15 * 60); // 3 * 60s default
 
 
             println!("hello from rust");
