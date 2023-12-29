@@ -59,7 +59,19 @@ impl Reader for CloudObjectReader {
 
     /// Object/File Size.
     async fn size(&self) -> Result<usize> {
-        Ok(self.object_store.head(&self.path).await?.size)
+        let mut retries = 5; // Number of retries
+        loop {
+            match self.object_store.head(&self.path).await {
+                Ok(head) => return Ok(head.size),
+                Err(err) => {
+                    println!("hit object size failure! attempting retry logic..");
+                    if retries == 0 {
+                        return Err(err.into()); // If retries are exhausted, return the error
+                    }
+                    retries -= 1; // Decrement the retry count
+                }
+            }
+        }
     }
 
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {

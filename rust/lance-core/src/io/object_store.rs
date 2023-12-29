@@ -829,7 +829,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             retry_config.retry_timeout = std::time::Duration::from_secs(15 * 60); // 3 * 60s default
 
 
-            println!("hello from rust 4s");
+            println!("hello from rust 10s with head retry");
             builder = builder
                 .with_url(url.as_ref())
                 .with_credentials(aws_creds)
