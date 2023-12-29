@@ -36,7 +36,7 @@ use object_store::{
     aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory, CredentialProvider,
     Error as ObjectStoreError, Result as ObjectStoreResult,
 };
-use object_store::{parse_url_opts, DynObjectStore};
+use object_store::{parse_url_opts, DynObjectStore, RetryConfig, BackoffConfig};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use shellexpand::tilde;
 use snafu::{location, Location};
@@ -813,10 +813,26 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             for (key, value) in storage_options {
                 builder = builder.with_config(key, value);
             }
+            // Initialize BackoffConfig with default values and modify as needed
+            let mut backoff_config = BackoffConfig::default();
+            // defaults:
+            // https://docs.rs/object_store/latest/src/object_store/client/backoff.rs.html#26-33
+            backoff_config.init_backoff = std::time::Duration::from_secs(1); // 100ms default
+            backoff_config.max_backoff = std::time::Duration::from_secs(10); // 15s default
+            backoff_config.base = 2.0; // 2.0 default
+
+            // Initialize RetryConfig with default values and set the custom backoff_config
+            // https://docs.rs/object_store/latest/src/object_store/client/retry.rs.html#152-158
+            let mut retry_config = RetryConfig::default();
+            retry_config.backoff = backoff_config;
+            retry_config.max_retries = 5; // 10 default
+            retry_config.retry_timeout = std::time::Duration::from_secs(60); // 3 * 60s default
+
             builder = builder
                 .with_url(url.as_ref())
                 .with_credentials(aws_creds)
                 .with_region(region)
+                .with_retry(retry_config)
                 .with_allow_http(true);
             let store = builder.build()?;
 
