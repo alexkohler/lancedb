@@ -817,7 +817,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             let mut backoff_config = BackoffConfig::default();
             // defaults:
             // https://docs.rs/object_store/latest/src/object_store/client/backoff.rs.html#26-33
-            backoff_config.init_backoff = std::time::Duration::from_secs(1); // 100ms default
+            backoff_config.init_backoff = std::time::Duration::from_secs(5); // 100ms default
             backoff_config.max_backoff = std::time::Duration::from_secs(60); // 15s default
             backoff_config.base = 2.0; // 2.0 default
 
@@ -829,7 +829,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             retry_config.retry_timeout = std::time::Duration::from_secs(15 * 60); // 3 * 60s default
 
 
-            println!("hello from rust");
+            println!("hello from rust 4s");
             builder = builder
                 .with_url(url.as_ref())
                 .with_credentials(aws_creds)
