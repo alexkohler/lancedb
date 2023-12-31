@@ -817,16 +817,16 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             let mut backoff_config = BackoffConfig::default();
             // defaults:
             // https://docs.rs/object_store/latest/src/object_store/client/backoff.rs.html#26-33
-            backoff_config.init_backoff = std::time::Duration::from_secs(15); // 100ms default
-            backoff_config.max_backoff = std::time::Duration::from_secs(180); // 15s default
+            backoff_config.init_backoff = std::time::Duration::from_secs(30); // 100ms default
+            backoff_config.max_backoff = std::time::Duration::from_secs(300); // 15s default
             backoff_config.base = 2.0; // 2.0 default
 
             // Initialize RetryConfig with default values and set the custom backoff_config
             // https://docs.rs/object_store/latest/src/object_store/client/retry.rs.html#152-158
             let mut retry_config = RetryConfig::default();
             retry_config.backoff = backoff_config;
-            retry_config.max_retries = 15; // 10 default
-            retry_config.retry_timeout = std::time::Duration::from_secs(15 * 60); // 3 * 60s default
+            retry_config.max_retries = 20; // 10 default
+            retry_config.retry_timeout = std::time::Duration::from_secs(20 * 60); // 3 * 60s default
 
 
             println!("hello from rust 10s with head retry");
