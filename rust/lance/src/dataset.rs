@@ -980,8 +980,10 @@ impl Dataset {
                 fragment.take(local_ids, projection)
             })
             .collect::<Vec<_>>();
+
+        println!("reducing batches by 4x...")
         let batches = stream::iter(take_tasks)
-            .buffered(num_cpus::get() * 4)
+            .buffered(num_cpus::get())
             .try_collect::<Vec<RecordBatch>>()
             .await?;
 
