@@ -981,7 +981,7 @@ impl Dataset {
             })
             .collect::<Vec<_>>();
 
-        println!("reducing batches by 4x...")
+        println!("reducing batches by 4x...");
         let batches = stream::iter(take_tasks)
             .buffered(num_cpus::get())
             .try_collect::<Vec<RecordBatch>>()
