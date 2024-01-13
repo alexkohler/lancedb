@@ -20,7 +20,6 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
-from helper import requires_pyarrow_12
 from lance.arrow import (
     BFloat16,
     BFloat16Array,
@@ -29,6 +28,7 @@ from lance.arrow import (
     PandasBFloat16Array,
     bfloat16_array,
 )
+from ml_dtypes import bfloat16
 
 
 def test_bf16_value():
@@ -68,7 +68,11 @@ def test_bf16_repr():
     assert arr.to_pylist() == expected
 
     expected_re = r"""<lance.arrow.BFloat16Array object at 0x[\w\d]+>
-\[1.1015625, None, 3.40625\]"""
+\[
+  1.1015625,
+  None,
+  3.40625
+\]"""
     assert re.match(expected_re, repr(arr))
 
     # TODO: uncomment tests once fixed upstream.
@@ -81,6 +85,14 @@ def test_bf16_repr():
 # ---
 # x: \[\[1.1015625, None, 3.40625\]\]"""
 #     assert re.match(expected_re, repr(tab))
+
+
+def test_bf16_array_str():
+    from ml_dtypes import bfloat16
+
+    np_arr = np.array([1.0, 2.0, 3.0], dtype=bfloat16)
+    arr = BFloat16Array.from_numpy(np_arr)
+    assert str(arr) == "[\n  1,\n  2,\n  3\n]"
 
 
 def test_bf16_pandas(provide_pandas):
@@ -125,7 +137,31 @@ def test_bf16_numpy():
     np.testing.assert_array_equal(arr_arrow.to_numpy(), expected)
 
 
-@requires_pyarrow_12
+def test_bf16_array_cast():
+    for dt in [np.float16, np.float32, np.float64]:
+        floats = pa.array(np.array([1.0, 2.0, 3.0, 4.0], dtype=dt))
+        bf16_arr = lance.arrow.cast(floats, "bfloat16")
+        assert isinstance(bf16_arr, BFloat16Array)
+        assert bf16_arr[0] == BFloat16(1.0)
+        assert bf16_arr[0] == bfloat16(1.0)
+
+        casted = lance.arrow.cast(bf16_arr, floats.type)
+        assert casted == floats
+
+
+def test_bf16_fixed_size_list_cast():
+    for dt in [np.float16, np.float32, np.float64]:
+        floats = pa.array(np.array([1.0, 2.0, 3.0, 4.0], dtype=dt))
+        fsl = pa.FixedSizeListArray.from_arrays(floats, 2)
+        bf16_fsl = lance.arrow.cast(fsl, pa.list_(lance.arrow.BFloat16Type(), 2))
+        assert bf16_fsl.values == BFloat16Array.from_numpy(
+            np.array([1.0, 2.0, 3.0, 4.0], dtype=bfloat16)
+        )
+
+        casted = lance.arrow.cast(bf16_fsl, fsl.type)
+        assert casted == fsl
+
+
 def test_roundtrip_take_ext_types(tmp_path: Path):
     tensor_type = pa.fixed_shape_tensor(pa.float32(), [2, 3])
     inner = pa.array([float(x) for x in range(0, 18)], pa.float32())
@@ -229,7 +265,6 @@ def test_image_arrays(tmp_path: Path):
     )
 
 
-@requires_pyarrow_12
 def test_roundtrip_image_tensor(tmp_path: Path):
     import os
 

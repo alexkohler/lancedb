@@ -1,4 +1,4 @@
-#  Copyright 2023 Lance Developers
+#  Copyright 2024 Lance Developers
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -13,20 +13,23 @@
 
 """Embedding vector utilities"""
 
+from __future__ import annotations
+
 import logging
 import re
-from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Union
+import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Literal, Optional, Union
 
-import numpy as np
 import pyarrow as pa
 from tqdm.auto import tqdm
 
-from . import LanceDataset
-from .fragment import write_fragments
+from . import write_dataset
+from .dependencies import _check_for_numpy, torch
+from .dependencies import numpy as np
 
 if TYPE_CHECKING:
-    import torch
+    from . import LanceDataset
 
 
 def _normalize_vectors(vectors, ndim):
@@ -109,7 +112,9 @@ def vec_to_table(
         vectors = _normalize_vectors(values, ndim)
         ids = pa.array(data.keys())
         arrays = [ids, vectors]
-    elif isinstance(data, (list, np.ndarray)):
+    elif isinstance(data, list) or (
+        _check_for_numpy(data) and isinstance(data, np.ndarray)
+    ):
         if names is None:
             names = ["vector"]
         elif isinstance(names, str):
@@ -122,7 +127,8 @@ def vec_to_table(
         arrays = [vectors]
     else:
         raise NotImplementedError(
-            f"data must be dict, list, or ndarray, got {type(data)} instead"
+            f"data must be dict, list, or ndarray (require numpy installed), \
+            got {type(data)} instead"
         )
     return pa.Table.from_arrays(arrays, names=names)
 
@@ -134,10 +140,11 @@ def train_ivf_centroids_on_accelerator(
     dataset: LanceDataset,
     column: str,
     k: int,
-    metric_type: str,
+    metric_type: Literal["l2", "cosine", "dot"],
     accelerator: Union[str, "torch.Device"],
     *,
     sample_rate: int = 256,
+    max_iters: int = 50,
 ) -> (np.ndarray, str):
     """Use accelerator (GPU or MPS) to train kmeans."""
     if isinstance(accelerator, str) and (
@@ -150,10 +157,6 @@ def train_ivf_centroids_on_accelerator(
 
     sample_size = k * sample_rate
 
-    # Pytorch installation warning will be raised here.
-    import torch
-
-    from lance.torch.async_dataset import async_dataset
     from lance.torch.data import LanceDataset as TorchDataset
 
     from .torch.kmeans import KMeans
@@ -166,80 +169,117 @@ def train_ivf_centroids_on_accelerator(
     init_centroids = torch.from_numpy(np.stack(fsl.to_numpy(zero_copy_only=False)))
     logging.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
-    ds = partial(
-        TorchDataset,
+    ds = TorchDataset(
         dataset,
         batch_size=20480,
         columns=[column],
         samples=sample_size,
-        cache=False,
+        cache=True,
     )
 
-    with async_dataset(ds) as ds:
-        logging.info("Training IVF partitions using GPU(%s)", accelerator)
-        kmeans = KMeans(
-            k, metric=metric_type, device=accelerator, centroids=init_centroids
-        )
-        kmeans.fit(ds)
-
-    return kmeans.centroids.cpu().numpy(), compute_partitions(
-        dataset, column, kmeans, batch_size=20480
+    logging.info("Training IVF partitions using GPU(%s)", accelerator)
+    kmeans = KMeans(
+        k,
+        max_iters=max_iters,
+        metric=metric_type,
+        device=accelerator,
+        centroids=init_centroids,
     )
+    kmeans.fit(ds)
+
+    centroids = kmeans.centroids.cpu().numpy()
+
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        np.save(f, centroids)
+    logging.info("Saved centroids to %s", f.name)
+
+    return centroids, compute_partitions(dataset, column, kmeans, batch_size=20480)
 
 
 def compute_partitions(
     dataset: LanceDataset,
     column: str,
     kmeans: Any,  # KMeans
-    batch_size: int = 1024,
-) -> np.ndarray:
-    import torch
+    batch_size: int = 10240,
+    spill_dir: Union[str, Path] = None,
+) -> str:
+    """Compute partitions for each row using GPU kmeans and spill to disk.
 
-    from lance.torch.async_dataset import async_dataset
+    Parameters
+    ----------
+    dataset: LanceDataset
+        Dataset to compute partitions for.
+    column: str
+        Column name of the vector column.
+    kmeans: lance.torch.kmeans.KMeans
+        KMeans model to use to compute partitions.
+    batch_size: int, default 10240
+        The batch size used to read the dataset.
+    spill_dir: Path
+        The path to store the partitions.
+
+    Returns
+    -------
+    str
+        The absolute path of the partition dataset.
+    """
     from lance.torch.data import LanceDataset as PytorchLanceDataset
 
-    torch_ds = partial(
-        PytorchLanceDataset,
+    torch_ds = PytorchLanceDataset(
         dataset,
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
     )
-    with async_dataset(torch_ds) as torch_ds:
-        output_schema = pa.schema(
-            [pa.field("row_id", pa.uint64()), pa.field("partition", pa.uint32())]
-        )
+    output_schema = pa.schema(
+        [pa.field("row_id", pa.uint64()), pa.field("partition", pa.uint32())]
+    )
 
-        def _f() -> Iterable[pa.RecordBatch]:
-            with torch.no_grad():
-                for batch in torch_ds:
-                    batch: Dict[str, torch.Tensor] = batch
-                    vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
-                    ids = batch["_rowid"].reshape(-1)
+    def _partition_assignment() -> Iterable[pa.RecordBatch]:
+        with torch.no_grad():
+            for batch in torch_ds:
+                batch: Dict[str, torch.Tensor] = batch
+                vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
 
-                    # this is expect to be true, so just assert
-                    assert vecs.shape[0] == ids.shape[0]
+                vecs.to(kmeans.device)
+                partitions = kmeans.transform(vecs).cpu().numpy()
+                ids = batch["_rowid"].reshape(-1).cpu().numpy()
 
-                    vecs.to(kmeans.device)
-                    partitions = kmeans.transform(vecs)
-                    batch = pa.RecordBatch.from_arrays(
-                        [ids.cpu().numpy(), partitions.cpu().numpy()],
-                        schema=output_schema,
+                # this is expected to be true, so just assert
+                assert vecs.shape[0] == ids.shape[0]
+
+                # Ignore any invalid vectors.
+                ids = ids[partitions >= 0]
+                partitions = partitions[partitions >= 0]
+                part_batch = pa.RecordBatch.from_arrays(
+                    [ids, partitions],
+                    schema=output_schema,
+                )
+                if len(part_batch) < len(ids):
+                    logging.warning(
+                        "%s vectors are ignored during partition assignment",
+                        len(part_batch) - len(ids),
                     )
 
-                    yield batch
+                yield part_batch
 
-        rbr = pa.RecordBatchReader.from_batches(output_schema, tqdm(_f()))
+    rbr = pa.RecordBatchReader.from_batches(
+        output_schema, tqdm(_partition_assignment())
+    )
 
-        fragments = write_fragments(
-            rbr,
-            dataset.uri,
-            schema=output_schema,
-            max_rows_per_file=dataset.count_rows(),
-        )
-    assert len(fragments) == 1
+    if spill_dir is None:
+        spill_dir = tempfile.mkdtemp()
 
-    files = fragments[0].data_files()
+    spill_uri = Path(spill_dir) / "precomputed_partitions.lance"
+
+    ds = write_dataset(
+        rbr,
+        spill_uri,
+        schema=output_schema,
+        max_rows_per_file=dataset.count_rows(),
+    )
+    assert len(ds.get_fragments()) == 1
+    files = ds.get_fragments()[0].data_files()
     assert len(files) == 1
 
-    return files[0].path()
+    return str(spill_uri)

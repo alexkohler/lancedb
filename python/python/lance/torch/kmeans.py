@@ -1,4 +1,4 @@
-#  Copyright (c) 2023. Lance Developers
+#  Copyright (c) 2024. Lance Developers
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -14,13 +14,13 @@
 
 import logging
 import time
-from typing import List, Optional, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 
-import numpy as np
 import pyarrow as pa
-import torch
-from torch.utils.data import IterableDataset
 from tqdm import tqdm
+
+from lance.dependencies import _check_for_numpy, _check_for_torch, torch
+from lance.dependencies import numpy as np
 
 from . import preferred_device
 from .data import TensorDataset
@@ -45,8 +45,10 @@ class KMeans:
     max_iters: int
         Max number of iterations to train the kmean model.
     tolerance: float
-        Relative tolerance with regards to Frobenius norm of the difference in
+        Relative tolerance in regard to Frobenius norm of the difference in
         the cluster centers of two consecutive iterations to declare convergence.
+    centroids : torch.Tensor, optional.
+        Provide existing centroids.
     seed: int, optional
         Random seed
     device: str, optional
@@ -58,8 +60,8 @@ class KMeans:
         self,
         k: int,
         *,
-        metric: str = "l2",
-        init: str = "random",
+        metric: Literal["l2", "euclidean", "cosine", "dot"] = "l2",
+        init: Literal["random"] = "random",
         max_iters: int = 50,
         tolerance: float = 1e-4,
         centroids: Optional[torch.Tensor] = None,
@@ -96,7 +98,7 @@ class KMeans:
     ) -> torch.Tensor:
         if isinstance(data, pa.FixedSizeListArray):
             data = torch.from_numpy(np.stack(data.to_numpy(zero_copy_only=False)))
-        elif isinstance(data, np.ndarray):
+        elif _check_for_numpy(data) and isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
         elif isinstance(data, torch.Tensor):
             # Good type
@@ -112,14 +114,25 @@ class KMeans:
 
     def _random_init(self, data: Union[torch.Tensor, np.ndarray]):
         """Random centroid initialization."""
-        indices = np.random.choice(data.shape[0], self.k)
-        if isinstance(data, np.ndarray):
-            data = torch.from_numpy(data)
-        self.centroids = data[indices]
+        if self.centroids is not None:
+            logging.debug("KMeans centroids already initialized")
+            return
+
+        is_numpy = _check_for_numpy(data) and isinstance(data, np.ndarray)
+        if is_numpy or (_check_for_torch(data) and isinstance(data, torch.Tensor)):
+            indices = np.random.choice(data.shape[0], self.k)
+            if is_numpy:
+                data = torch.from_numpy(data)
+            self.centroids = data[indices]
 
     def fit(
         self,
-        data: Union[IterableDataset, np.ndarray, torch.Tensor, pa.FixedSizeListArray],
+        data: Union[
+            torch.utils.data.IterableDataset,
+            np.ndarray,
+            torch.Tensor,
+            pa.FixedSizeListArray,
+        ],
     ) -> None:
         """Fit - Train the kmeans model.
 
@@ -131,9 +144,13 @@ class KMeans:
         start = time.time()
         if isinstance(data, pa.FixedSizeListArray):
             data = np.stack(data.to_numpy(zero_copy_only=False))
-        if isinstance(data, (np.ndarray, torch.Tensor)):
+        elif isinstance(data, pa.FixedShapeTensorArray):
+            data = data.to_numpy_ndarray()
+        if (_check_for_torch(data) and isinstance(data, torch.Tensor)) or (
+            _check_for_numpy(data) and isinstance(data, np.ndarray)
+        ):
             self._random_init(data)
-            data = TensorDataset(data, batch_size=4096)
+            data = TensorDataset(data, batch_size=10240)
 
         assert self.centroids is not None
         self.centroids = self.centroids.to(self.device)
@@ -153,9 +170,8 @@ class KMeans:
                 logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
         logging.info("Finish KMean training in %s", time.time() - start)
 
-    @staticmethod
     def _updated_centroids(
-        centroids: torch.Tensor, counts: torch.Tensor
+        self, centroids: torch.Tensor, counts: torch.Tensor
     ) -> torch.Tensor:
         for idx, cnt in enumerate(counts.cpu()):
             # split the largest cluster and remove empty cluster
@@ -165,24 +181,35 @@ class KMeans:
                 counts[idx], counts[max_idx] = half_cnt, half_cnt
                 centroids[idx] = centroids[max_idx] * 1.05
                 centroids[max_idx] = centroids[max_idx] / 1.05
-        return centroids / counts[:, None]
+
+        centroids = centroids / counts[:, None]
+        if self.metric == "cosine":
+            # normalize the centroids
+            centroids = torch.nn.functional.normalize(centroids)
+        return centroids
 
     @staticmethod
     def _count_rows_in_clusters(part_ids: List[torch.Tensor], k: int) -> torch.Tensor:
         max_len = max([len(ids) for ids in part_ids])
-        ones = torch.ones(max_len).to(part_ids[0].device)
-        num_rows = torch.zeros(k).to(part_ids[0].device)
+        ones = torch.ones(max_len, device=part_ids[0].device)
+        num_rows = torch.zeros(k, device=part_ids[0].device)
         for part_id in part_ids:
             num_rows.scatter_add_(0, part_id, ones)
         return num_rows
 
-    def _fit_once(self, data: IterableDataset, epoch: int, last_dist=0) -> float:
+    def _fit_once(
+        self, data: torch.utils.data.IterableDataset, epoch: int, last_dist: float = 0.0
+    ) -> float:
         """Train KMean once and return the total distance.
 
         Parameters
         ----------
-        chunks : List[torch.Tensor]
+        data : List[torch.Tensor]
             A list of 2-D tensors, each tensor is a chunk of the input data.
+        epoch : int
+            The epoch of this training process
+        last_dist : float
+            The total distance of the last epoch.
 
         Returns
         -------
@@ -191,18 +218,33 @@ class KMeans:
         """
         total_dist = 0
 
-        new_centroids = torch.zeros_like(self.centroids, device=self.device)
+        # Use float32 to accumulate centroids, esp. if the vectors are
+        # float16 / bfloat16 types.
+        new_centroids = torch.zeros_like(
+            self.centroids, device=self.device, dtype=torch.float32
+        )
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
+        ones = torch.ones(1024 * 16, device=self.device)
+        y2 = (self.centroids * self.centroids).sum(dim=1)
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
+            chunk: torch.Tensor = chunk
+            dtype = chunk.dtype
             chunk = chunk.to(self.device)
-            ids, dists = self._transform(chunk)
-            total_dist += dists.sum().item()
-            ones = torch.ones(len(ids), device=self.device)
+            ids, dists = self._transform(chunk, y2=y2)
 
-            new_centroids.index_add_(0, ids, chunk)
-            counts_per_part.index_add_(0, ids, ones)
+            valid_mask = ids >= 0
+            if torch.any(~valid_mask):
+                chunk = chunk[valid_mask]
+                ids = ids[valid_mask]
+
+            total_dist += dists.nansum().item()
+            if ones.shape[0] < ids.shape[0]:
+                ones = torch.ones(len(ids), out=ones, device=self.device)
+
+            new_centroids.index_add_(0, ids, chunk.type(torch.float32))
+            counts_per_part.index_add_(0, ids, ones[: ids.shape[0]])
             del ids
             del dists
             del chunk
@@ -210,13 +252,20 @@ class KMeans:
         if abs(total_dist - last_dist) / total_dist < self.tolerance:
             raise StopIteration("kmeans: converged")
 
-        self.centroids = self._updated_centroids(new_centroids, counts_per_part)
+        # cast to the type we get the data in
+        self.centroids = self._updated_centroids(new_centroids, counts_per_part).type(
+            dtype
+        )
         return total_dist
 
-    def _transform(self, data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _transform(
+        self,
+        data: torch.Tensor,
+        y2: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.metric == "cosine":
             data = torch.nn.functional.normalize(data)
-        return self.dist_func(data, self.centroids)
+        return self.dist_func(data, self.centroids, y2=y2)
 
     def transform(
         self, data: Union[pa.Array, np.ndarray, torch.Tensor]

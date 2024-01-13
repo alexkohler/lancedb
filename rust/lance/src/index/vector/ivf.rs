@@ -17,7 +17,6 @@
 use std::{
     any::Any,
     collections::HashMap,
-    ops::RangeFull,
     sync::{Arc, Weak},
 };
 
@@ -25,10 +24,10 @@ use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array, AsArray},
     types::{Float16Type, Float32Type, Float64Type},
-    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array, UInt64Array,
+    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::DataType;
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
 use futures::{
@@ -37,17 +36,14 @@ use futures::{
 };
 use lance_arrow::*;
 use lance_core::io::{
-    local::to_local_path, FileReader, ObjectWriter, Reader, RecordBatchStream, WriteExt, Writer,
+    local::to_local_path, ObjectWriter, Reader, RecordBatchStream, WriteExt, Writer,
 };
 use lance_core::{
-    datatypes::{Field, Schema},
-    encodings::plain::PlainEncoder,
-    format::Index as IndexMetadata,
-    Error, Result,
+    datatypes::Field, encodings::plain::PlainEncoder, format::Index as IndexMetadata, Error, Result,
 };
 use lance_index::{
     vector::{
-        ivf::IvfBuildParams,
+        ivf::{builder::load_precomputed_partitions, shuffler::shuffle_dataset, IvfBuildParams},
         pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
         Query, DIST_COL,
     },
@@ -65,15 +61,13 @@ use uuid::Uuid;
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
 use super::{pq::PQIndex, utils::maybe_sample_training_data, VectorIndex};
+use crate::dataset::builder::DatasetBuilder;
 use crate::{
-    dataset::{Dataset, DATA_DIR},
+    dataset::Dataset,
     index::{
         pb,
         prefilter::PreFilter,
-        vector::{
-            ivf::{builder::shuffle_dataset_v2, io::write_index_partitions},
-            Transformer,
-        },
+        vector::{ivf::io::write_index_partitions, Transformer},
         INDEX_FILE_NAME,
     },
     session::Session,
@@ -215,19 +209,21 @@ impl IVFIndex {
             column,
             pq_index.pq.clone(),
             None,
-            None,
         )?;
 
-        let shuffled = shuffle_dataset_v2(
+        let shuffled = shuffle_dataset(
             data,
             column,
             ivf,
+            None,
             self.ivf.num_partitions() as u32,
             pq_index.pq.num_sub_vectors(),
+            10000,
+            2,
         )
         .await?;
         let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
-        write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(self)).await?;
+        write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&[self])).await?;
         let metadata = IvfPQIndexMetadata {
             name: metadata.name.clone(),
             column: column.to_string(),
@@ -368,6 +364,10 @@ impl VectorIndex for IVFIndex {
         false
     }
 
+    fn check_can_remap(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn load(
         &self,
         _reader: &dyn Reader,
@@ -378,10 +378,6 @@ impl VectorIndex for IVFIndex {
             message: "Flat index does not support load".to_string(),
             location: location!(),
         })
-    }
-
-    fn check_can_remap(&self) -> Result<()> {
-        Ok(())
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
@@ -395,6 +391,10 @@ impl VectorIndex for IVFIndex {
             message: "Remapping IVF in this way not supported".to_string(),
             location: location!(),
         })
+    }
+
+    fn metric_type(&self) -> MetricType {
+        self.metric_type
     }
 }
 
@@ -523,7 +523,6 @@ impl Ivf {
             metric_type,
             vec![],
             None,
-            None,
         )?;
         internal.find_partitions(query, nprobes)
     }
@@ -617,7 +616,7 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
 fn sanity_check_ivf_param(params: &IvfBuildParams) -> Result<()> {
     if params.precomputed_partitons_file.is_some() && params.centroids.is_none() {
         return Err(Error::Index {
-            message: "precomputed_partitons_file requires centroids to be set".to_string(),
+            message: "precomputed_partitions_file requires centroids to be set".to_string(),
             location: location!(),
         });
     }
@@ -725,7 +724,7 @@ pub async fn build_ivf_pq_index(
         train_ivf_model(training_data.as_ref().unwrap(), metric_type, ivf_params).await?
     };
     info!(
-        "Traied IVF model in {:02} seconds",
+        "Trained IVF model in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
 
@@ -773,7 +772,6 @@ pub async fn build_ivf_pq_index(
             metric_type,
             vec![],
             None,
-            None,
         )?;
 
         info!(
@@ -811,54 +809,10 @@ pub async fn build_ivf_pq_index(
     let precomputed_partitions = match &ivf_params.precomputed_partitons_file {
         Some(file) => {
             info!("Loading precomputed partitions from file: {}", file);
-            let arrow_schema = ArrowSchema::new(vec![
-                ArrowField::new("row_id", DataType::UInt64, false),
-                ArrowField::new("partition", DataType::UInt32, false),
-            ]);
+            let ds = DatasetBuilder::from_uri(file).load().await?;
+            let stream = ds.scan().try_into_stream().await?;
 
-            let schema = Schema::try_from(&arrow_schema)?;
-
-            let reader = FileReader::try_new_with_fragment(
-                dataset.object_store.as_ref(),
-                &dataset.base.child(DATA_DIR).child(file.as_str()),
-                0,
-                None,
-                None,
-            )
-            .await?;
-
-            let mut partition_lookup = HashMap::with_capacity(reader.len());
-
-            for i in 0..reader.num_batches() {
-                let batch = reader.read_batch(i as i32, RangeFull, &schema).await?;
-                let row_ids = batch.column_by_name("row_id");
-                let partitions = batch.column_by_name("partition");
-                match (row_ids, partitions) {
-                    (Some(row_ids), Some(partitions)) => {
-                        let row_ids: &UInt64Array = as_primitive_array(row_ids.as_ref());
-                        let partitons_ids: &UInt32Array = as_primitive_array(partitions.as_ref());
-
-                        for (row_id, partition) in
-                            row_ids.values().iter().zip(partitons_ids.values().iter())
-                        {
-                            partition_lookup.insert(*row_id, *partition);
-                        }
-                    }
-                    _ => {
-                        return Err(Error::Index {
-                            message: "malformed partition file".into(),
-                            location: location!(),
-                        })
-                    }
-                }
-            }
-
-            info!(
-                "Loaded {} rows of precomputed partitions",
-                partition_lookup.len()
-            );
-
-            Some(partition_lookup)
+            Some(load_precomputed_partitions(stream, ds.count_rows().await?).await?)
         }
         None => None,
     };
@@ -874,6 +828,8 @@ pub async fn build_ivf_pq_index(
         metric_type,
         stream,
         precomputed_partitions,
+        ivf_params.shuffle_partition_batches,
+        ivf_params.shuffle_partition_concurrency,
     )
     .await
 }
@@ -925,7 +881,7 @@ impl RemapPageTask {
     }
 }
 
-fn generate_remap_tasks(offsets: &Vec<usize>, lengths: &[u32]) -> Result<Vec<RemapPageTask>> {
+fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapPageTask>> {
     let mut tasks: Vec<RemapPageTask> = Vec::with_capacity(offsets.len() * 2 + 1);
 
     for (offset, length) in offsets.iter().zip(lengths.iter()) {
@@ -1011,6 +967,8 @@ async fn write_index_file(
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin + 'static,
     precomputed_partitons: Option<HashMap<u64, u32>>,
+    shuffle_partition_batches: usize,
+    shuffle_partition_concurrency: usize,
 ) -> Result<()> {
     let object_store = dataset.object_store();
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
@@ -1027,6 +985,8 @@ async fn write_index_file(
         metric_type,
         0..num_partitions,
         precomputed_partitons,
+        shuffle_partition_batches,
+        shuffle_partition_concurrency,
     )
     .await?;
     info!("Built IVF partitions: {}s", start.elapsed().as_secs_f32());

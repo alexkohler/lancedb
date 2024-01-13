@@ -37,11 +37,13 @@ from typing import (
     Union,
 )
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 
+from .dependencies import _check_for_numpy, _check_for_pandas, torch
+from .dependencies import numpy as np
+from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import CleanupStats, _Dataset, _Operation, _Scanner, _write_dataset
 from .lance import CompactionMetrics as CompactionMetrics
@@ -49,8 +51,11 @@ from .lance import __version__ as __version__
 from .optimize import Compaction
 from .util import td_to_micros
 
-try:
-    import pandas as pd
+if TYPE_CHECKING:
+    from pyarrow._compute import Expression
+
+    from .commit import CommitLock
+    from .progress import FragmentWriteProgress
 
     ReaderLike = Union[
         pd.Timestamp,
@@ -60,6 +65,7 @@ try:
         Iterable[RecordBatch],
         pa.RecordBatchReader,
     ]
+
     QueryVectorLike = Union[
         pd.Series,
         pa.Array,
@@ -67,28 +73,6 @@ try:
         np.ndarray,
         Iterable[float],
     ]
-except ImportError:
-    pd = None
-    ReaderLike = Union[
-        pa.Table,
-        pa.dataset.Dataset,
-        pa.dataset.Scanner,
-        Iterable[RecordBatch],
-        pa.RecordBatchReader,
-    ]
-    QueryVectorLike = Union[
-        pa.Array,
-        pa.Scalar,
-        np.ndarray,
-        Iterable[float],
-    ]
-
-if TYPE_CHECKING:
-    import torch
-    from pyarrow._compute import Expression
-
-    from .commit import CommitLock
-    from .progress import FragmentWriteProgress
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -190,7 +174,7 @@ class LanceDataset(pa.dataset.Dataset):
                     "refine_factor": 1
                 }
         batch_size: int, default None
-            The number of rows to fetch per batch.
+            The max size of batches returned.
         batch_readahead: int, optional
             The number of batches to read ahead.
         fragment_readahead: int, optional
@@ -315,12 +299,18 @@ class LanceDataset(pa.dataset.Dataset):
             Whether to read the fragments and batches in order. If false,
             throughput may be higher, but batches will be returned out of order
             and memory use might increase.
+        prefilter: bool, default False
+            Run filter before the vector search.
+        with_row_id: bool, default False
+            Return physical row ID.
+        use_stats: bool, default True
+            Use stats pushdown during filters.
 
         Notes
         -----
-        For now, if BOTH filter and nearest is specified, then:
+        If BOTH filter and nearest is specified, then:
         1. nearest is executed first.
-        2. The results are filtered afterwards.
+        2. The results are filtered afterward, unless pre-filter sets to True.
         """
         return self.scanner(
             columns=columns,
@@ -350,11 +340,8 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("not changing schemas yet")
 
-    def get_fragments(
-        self, filter: Optional[Expression] = None
-    ) -> Iterator[pa.dataset.Fragment]:
+    def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
         """Get all fragments from the dataset.
-
 
         Note: filter is not supported yet.
         """
@@ -883,6 +870,8 @@ class LanceDataset(pa.dataset.Dataset):
         num_sub_vectors: Optional[int] = None,
         accelerator: Optional[Union[str, "torch.Device"]] = None,
         index_cache_size: Optional[int] = None,
+        shuffle_partition_batches: Optional[int] = None,
+        shuffle_partition_concurrency: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -916,6 +905,18 @@ class LanceDataset(pa.dataset.Dataset):
             If not set, use the CPU.
         index_cache_size : int, optional
             The size of the index cache in number of entries. Default value is 256.
+        shuffle_partition_batches : int, optional
+            The number of batches, using the row group size of the dataset, to include
+            in each shuffle partition. Default value is 10240.
+
+            Assuming the row group size is 1024, each shuffle partition will hold
+            10240 * 1024 = 10,485,760 rows. By making this value smaller, this shuffle
+            will consume less memory but will take longer to complete, and vice versa.
+        shuffle_partition_concurrency : int, optional
+            The number of shuffle partitions to process concurrently. Default value is 2
+
+            By making this value smaller, this shuffle will consume less memory but will
+            take longer to complete, and vice versa.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1050,7 +1051,9 @@ class LanceDataset(pa.dataset.Dataset):
 
             if ivf_centroids is not None:
                 # User provided IVF centroids
-                if isinstance(ivf_centroids, np.ndarray):
+                if _check_for_numpy(ivf_centroids) and isinstance(
+                    ivf_centroids, np.ndarray
+                ):
                     if (
                         len(ivf_centroids.shape) != 2
                         or ivf_centroids.shape[0] != num_partitions
@@ -1059,18 +1062,23 @@ class LanceDataset(pa.dataset.Dataset):
                             f"Ivf centroids must be 2D array: (clusters, dim), "
                             f"got {ivf_centroids.shape}"
                         )
-                    if ivf_centroids.dtype != np.float32:
+                    if ivf_centroids.dtype not in [np.float16, np.float32, np.float64]:
                         raise TypeError(
-                            f"IVF centroids must be float32, got {ivf_centroids.dtype}"
+                            "IVF centroids must be floating number"
+                            + f"got {ivf_centroids.dtype}"
                         )
                     dim = ivf_centroids.shape[1]
-                    values = pa.array(ivf_centroids.reshape(-1), type=pa.float32())
+                    values = pa.array(ivf_centroids.reshape(-1))
                     ivf_centroids = pa.FixedSizeListArray.from_arrays(values, dim)
                 # Convert it to RecordBatch because Rust side only accepts RecordBatch.
                 ivf_centroids_batch = pa.RecordBatch.from_arrays(
                     [ivf_centroids], ["_ivf_centroids"]
                 )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
+        if shuffle_partition_batches is not None:
+            kwargs["shuffle_partition_batches"] = shuffle_partition_batches
+        if shuffle_partition_concurrency is not None:
+            kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
         self._ds.create_index(column, index_type, name, replace, kwargs)
         return LanceDataset(self.uri, index_cache_size=index_cache_size)
@@ -1949,7 +1957,7 @@ def write_dataset(
 def _coerce_reader(
     data_obj: ReaderLike, schema: Optional[pa.Schema] = None
 ) -> pa.RecordBatchReader:
-    if pd and isinstance(data_obj, pd.DataFrame):
+    if _check_for_pandas(data_obj) and isinstance(data_obj, pd.DataFrame):
         return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
     elif isinstance(data_obj, pa.Table):
         return data_obj.to_reader()
@@ -1993,7 +2001,10 @@ def _coerce_query_vector(query: QueryVectorLike):
             query = query.value
         if isinstance(query.type, pa.FixedSizeListType):
             query = query.values
-    elif isinstance(query, (np.ndarray, list, tuple)):
+    elif isinstance(query, (list, tuple)) or (
+        _check_for_numpy(query),
+        isinstance(query, np.ndarray),
+    ):
         query = np.array(query).astype("float64")  # workaround for GH-608
         query = pa.FloatingPointArray.from_pandas(query, type=pa.float32())
     elif not isinstance(query, pa.Array):

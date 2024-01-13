@@ -18,14 +18,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, List, Optional, Union
 
-try:
-    import pandas as pd
-except ImportError:
-    pd = None
 import pyarrow as pa
 
+from .dependencies import _check_for_pandas
+from .dependencies import pandas as pd
 from .lance import _Fragment, _write_fragments
 from .lance import _FragmentMetadata as _FragmentMetadata
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
@@ -64,7 +62,7 @@ class FragmentMetadata:
         """Reconstruct :class:`FragmentMetadata` from a JSON blob"""
         return FragmentMetadata(json_data)
 
-    def data_files(self) -> Iterator[str]:
+    def data_files(self) -> Iterable[str]:
         """Return the data files of the fragment"""
         return self._metadata.data_files()
 
@@ -177,7 +175,7 @@ class LanceFragment(pa.dataset.Fragment):
         -------
         FragmentMetadata
         """
-        if pd and isinstance(data, pd.DataFrame):
+        if _check_for_pandas(data) and isinstance(data, pd.DataFrame):
             reader = pa.Table.from_pandas(data, schema=schema).to_reader()
         elif isinstance(data, pa.Table):
             reader = data.to_reader()
@@ -228,20 +226,40 @@ class LanceFragment(pa.dataset.Fragment):
         """
         return self._fragment.physical_rows
 
+    @property
+    def physical_schema(self) -> pa.Schema:
+        # override the pyarrow super class method otherwise causes segfault
+        raise NotImplementedError("Not implemented yet for LanceFragment")
+
+    @property
+    def partition_expression(self) -> pa.Schema:
+        # override the pyarrow super class method otherwise causes segfault
+        raise NotImplementedError("Not implemented yet for LanceFragment")
+
     def head(self, num_rows: int) -> pa.Table:
         return self.scanner(limit=num_rows).to_table()
 
     def scanner(
         self,
+        *,
         columns: Optional[list[str]] = None,
+        batch_size: Optional[int] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,
+        with_row_id: bool = False,
+        batch_readahead: int = 16,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
         filter_str = str(filter) if filter is not None else None
         s = self._fragment.scanner(
-            columns=columns, filter=filter_str, limit=limit, offset=offset
+            columns=columns,
+            batch_size=batch_size,
+            filter=filter_str,
+            limit=limit,
+            offset=offset,
+            with_row_id=with_row_id,
+            batch_readahead=batch_readahead,
         )
         from .dataset import LanceScanner
 
@@ -252,13 +270,23 @@ class LanceFragment(pa.dataset.Fragment):
 
     def to_batches(
         self,
+        *,
         columns: Optional[list[str]] = None,
+        batch_size: Optional[int] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,
+        with_row_id: bool = False,
+        batch_readahead: int = 16,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
-            columns=columns, filter=filter, limit=limit, offset=offset
+            columns=columns,
+            batch_size=batch_size,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            with_row_id=with_row_id,
+            batch_readahead=batch_readahead,
         ).to_batches()
 
     def to_table(
@@ -267,9 +295,14 @@ class LanceFragment(pa.dataset.Fragment):
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,
+        with_row_id: bool = False,
     ) -> pa.Table:
         return self.scanner(
-            columns=columns, filter=filter, limit=limit, offset=offset
+            columns=columns,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            with_row_id=with_row_id,
         ).to_table()
 
     def add_columns(
@@ -437,7 +470,7 @@ def write_fragments(
         fragment ids are left as zero meaning they are not yet specified. They
         will be assigned when the fragments are committed to a dataset.
     """
-    if pd and isinstance(data, pd.DataFrame):
+    if _check_for_pandas(data) and isinstance(data, pd.DataFrame):
         reader = pa.Table.from_pandas(data, schema=schema).to_reader()
     elif isinstance(data, pa.Table):
         reader = data.to_reader()

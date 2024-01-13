@@ -20,7 +20,6 @@ import time
 from subprocess import check_output
 
 import lance
-import numpy as np
 import pyarrow as pa
 
 
@@ -29,7 +28,9 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("uri", help="lance path", metavar="FILE")
-    parser.add_argument("-t", "--index-type", choices=["ivf_pq", "diskann"], default="ivf_pq")
+    parser.add_argument(
+        "-t", "--index-type", choices=["ivf_pq", "diskann"], default="ivf_pq"
+    )
     parser.add_argument("-m", "--metric", choices=["l2", "cosine"], default="l2")
     parser.add_argument(
         "-c",
@@ -65,7 +66,7 @@ def main():
         metric=args.metric,
         num_partitions=args.ivf_partitions,  # IVF
         num_sub_vectors=args.pq_subvectors,
-        replace=True
+        replace=True,
     )  # PQ
     end = time.time()
 
@@ -79,6 +80,7 @@ def main():
         "arch": platform.machine(),
         "params": {
             "type": args.index_type,
+            "metric": args.metric,
         },
         "duration": end - start,
     }

@@ -19,7 +19,6 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as pa_ds
 import pytest
-from helper import requires_pyarrow_12
 from lance.vector import vec_to_table
 
 
@@ -151,14 +150,47 @@ def test_create_index(tmp_path):
     dataset.create_index("emb", "IVF_PQ", num_partitions=16, num_sub_vectors=4)
 
 
-def _create_dataset(uri):
+def test_create_index_shuffle_params(tmp_path):
+    dataset = _create_dataset(str(tmp_path / "test.lance"), num_batches=10)
+
+    # all good
+    dataset = dataset.create_index(
+        "emb",
+        "IVF_PQ",
+        num_partitions=16,
+        num_sub_vectors=4,
+        shuffle_partition_batches=1,
+        shuffle_partition_concurrency=10,
+    )
+
+    embs = dataset.to_table()["emb"].to_numpy(zero_copy_only=False)
+
+    for emb in embs:
+        distance = dataset.to_table(
+            nearest={
+                "column": "emb",
+                "q": emb,
+                "k": 1,
+                "nprobes": 1,
+                "refine_factor": 5,
+            }
+        )["_distance"].to_pylist()[0]
+        assert abs(distance) < 1e-6
+
+
+def _create_dataset(uri, num_batches=1):
     schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), 32), False)])
     npvals = np.random.rand(1000, 32)
     npvals /= np.sqrt((npvals**2).sum(axis=1))[:, None]
     values = pa.array(npvals.ravel(), type=pa.float32())
     arr = pa.FixedSizeListArray.from_arrays(values, 32)
     tbl = pa.Table.from_arrays([arr], schema=schema)
-    return lance.write_dataset(tbl, uri)
+    lance.write_dataset(tbl, uri)
+
+    for _ in range(num_batches - 1):
+        lance.write_dataset(tbl, uri, mode="append")
+
+    return lance.dataset(uri)
 
 
 def test_schema_to_json():
@@ -219,7 +251,6 @@ def sample_data_all_types():
     )
 
 
-@requires_pyarrow_12
 def test_roundtrip_types(tmp_path, sample_data_all_types):
     dataset = lance.write_dataset(sample_data_all_types, tmp_path)
     roundtripped = dataset.to_table()
