@@ -341,6 +341,7 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
         let chunks = plan_take_chunks(&positions, indices, MIN_IO_SIZE)?;
 
         let positions_ref = positions.as_ref();
+        println!("smaller buffers!");
         futures::stream::iter(chunks)
             .map(|chunk| async move {
                 let chunk_offset = chunk.indices.value(0);
@@ -350,7 +351,7 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
                     .await?;
                 Result::Ok((chunk, chunk_offset, array))
             })
-            .buffered(num_cpus::get())
+            .buffered(1)
             .try_for_each(|(chunk, chunk_offset, array)| {
                 let array: &GenericByteArray<T> = array.as_bytes();
 

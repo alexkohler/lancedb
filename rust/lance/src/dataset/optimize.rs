@@ -181,7 +181,8 @@ impl Default for CompactionOptions {
             max_rows_per_group: 1024,
             materialize_deletions: true,
             materialize_deletions_threshold: 0.1,
-            num_threads: num_cpus::get(),
+            // num_threads: num_cpus::get(),
+            num_threads: 1,
         }
     }
 }
@@ -255,22 +256,30 @@ pub async fn compact_files(
 ) -> Result<CompactionMetrics> {
     options.validate();
 
+    println!("compact_files entrypoint...");
+
     let compaction_plan: CompactionPlan = plan_compaction(dataset, &options).await?;
 
+    println!("compact_files planned...");
     // If nothing to compact, don't make a commit.
     if compaction_plan.tasks().is_empty() {
         return Ok(CompactionMetrics::default());
     }
 
     let dataset_ref = &dataset.clone();
+    println!("compact_files cloned...");
 
     let result_stream = futures::stream::iter(compaction_plan.tasks.into_iter())
         .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &options))
         .buffer_unordered(options.num_threads);
+    println!("compact_files streamed...");
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
+    println!("compact_files collected...");
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
+    println!("compact_files committinh...");
     let metrics = commit_compaction(dataset, completed_tasks, remap_options).await?;
+    println!("compact_files committed...");
 
     Ok(metrics)
 }
@@ -506,7 +515,8 @@ pub async fn plan_compaction(
                 Err(e) => Err(e),
             }
         })
-        .buffered(num_cpus::get() * 2);
+        // .buffered(num_cpus::get() * 2);
+        .buffered(1);
 
     let index_fragmaps = load_index_fragmaps(dataset).await?;
     let indices_containing_frag = |frag_id: u32| {
@@ -851,6 +861,7 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
+    println!("committing compaction entrypoint...");
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
     let mut metrics = CompactionMetrics::default();
 
@@ -892,6 +903,7 @@ pub async fn commit_compaction(
         None,
     );
 
+    println!("committing transaction...");
     let manifest = commit_transaction(
         dataset,
         dataset.object_store(),

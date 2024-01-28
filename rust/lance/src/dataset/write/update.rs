@@ -229,12 +229,13 @@ impl UpdateJob {
         }
 
         let updates_ref = self.updates.clone();
+        println!("single thread execute");
         let stream = stream
             .map(move |batch| {
                 let updates = updates_ref.clone();
                 tokio::task::spawn_blocking(move || Self::apply_updates(batch?, updates))
             })
-            .buffered(num_cpus::get())
+            .buffered(1)
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
                 Ok(Err(err)) => Err(err),

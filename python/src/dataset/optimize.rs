@@ -529,6 +529,7 @@ impl PyCompaction {
         dataset: PyObject,
         rewrites: Vec<PyRewriteResult>,
     ) -> PyResult<PyCompactionMetrics> {
+        print!("commit entrypoint...");
         let dataset_ref = unwrap_dataset(dataset)?;
         let dataset = Python::with_gil(|py| dataset_ref.borrow(py).clone());
         let rewrites: Vec<RewriteResult> = rewrites.into_iter().map(|r| r.0).collect();
