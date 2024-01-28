@@ -23,7 +23,7 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use chrono::Duration;
 
-use futures::StreamExt;
+use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::UpdateBuilder;
 use lance::dataset::{
@@ -31,22 +31,25 @@ use lance::dataset::{
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
     Dataset as LanceDataset, ReadParams, Version, WriteMode, WriteParams,
 };
-use lance::index::IndexParams;
 use lance::index::{
     scalar::ScalarIndexParams,
     vector::{diskann::DiskANNParams, VectorIndexParams},
-    DatasetIndexExt,
 };
 use lance_arrow::as_fixed_size_list_array;
-use lance_core::{datatypes::Schema, format::Fragment, io::object_store::ObjectStoreParams};
+use lance_core::datatypes::Schema;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::{
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
-    IndexType,
+    DatasetIndexExt, IndexParams, IndexType,
 };
+use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
+use lance_table::format::Fragment;
+use lance_table::io::commit::CommitHandler;
+use object_store::path::Path;
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
-use pyo3::types::PySet;
+use pyo3::types::{PyList, PySet};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
@@ -167,18 +170,16 @@ impl Dataset {
         let mut params = ReadParams {
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
             metadata_cache_size: metadata_cache_size.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
-            session: None,
             store_options: Some(ObjectStoreParams {
                 block_size,
                 ..Default::default()
             }),
+            ..Default::default()
         };
 
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);
-            let mut object_store_params = ObjectStoreParams::default();
-            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
-            params.store_options = Some(object_store_params);
+            params.set_commit_lock(Arc::new(py_commit_lock));
         }
         let dataset = if let Some(ver) = version {
             RT.runtime
@@ -207,18 +208,17 @@ impl Dataset {
 
     /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
-        let index_statistics = RT
-            .runtime
+        RT.runtime
             .block_on(self.ds.index_statistics(&index_name))
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        if let Some(s) = index_statistics {
-            Ok(s)
-        } else {
-            Err(PyKeyError::new_err(format!(
-                "Index \"{}\" not found",
-                index_name
-            )))
-        }
+            .map_err(|err| match err {
+                lance::Error::IndexNotFound { .. } => {
+                    PyKeyError::new_err(format!("Index \"{}\" not found", index_name))
+                }
+                _ => PyIOError::new_err(format!(
+                    "Failed to get index statistics for index {}: {}",
+                    index_name, err
+                )),
+            })
     }
 
     /// Load index metadata
@@ -613,10 +613,20 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
+    fn checkout_version(&self, version: u64) -> PyResult<Self> {
+        let ds = RT
+            .block_on(None, self.ds.checkout_version(version))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(Self {
+            ds: Arc::new(ds),
+            uri: self.uri.clone(),
+        })
+    }
+
     /// Restore the current version
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.restore(None))?
+        RT.block_on(None, new_self.restore())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -641,10 +651,22 @@ impl Dataset {
         })
     }
 
-    fn optimize_indices(&mut self, _kwargs: Option<&PyDict>) -> PyResult<()> {
+    #[pyo3(signature = (**kwargs))]
+    fn optimize_indices(&mut self, kwargs: Option<&PyDict>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.optimize_indices())?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let mut options: OptimizeOptions = Default::default();
+        if let Some(kwargs) = kwargs {
+            if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
+                options.num_indices_to_merge = num_indices_to_merge.extract()?;
+            }
+        }
+        RT.block_on(
+            None,
+            new_self
+                .optimize_indices(&options)
+                .map_err(|err| PyIOError::new_err(err.to_string())),
+        )??;
+
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -702,6 +724,17 @@ impl Dataset {
                         pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
                     };
 
+                    if let Some(c) = kwargs.get_item("pq_codebook")? {
+                        let batch = RecordBatch::from_pyarrow(c)?;
+                        if "_pq_codebook" != batch.schema().field(0).name() {
+                            return Err(PyValueError::new_err(
+                                "Expected '_pq_codebook' as the first column name.",
+                            ));
+                        }
+                        let codebook = as_fixed_size_list_array(batch.column(0));
+                        pq_params.codebook = Some(codebook.values().clone())
+                    };
+
                     if let Some(o) = kwargs.get_item("max_opq_iterations")? {
                         pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
                     };
@@ -721,15 +754,30 @@ impl Dataset {
                         ivf_params.precomputed_partitons_file = Some(f.to_string());
                     };
 
-                    if let Some(o) = kwargs.get_item("shuffle_partition_batches")? {
-                        ivf_params.shuffle_partition_batches =
-                            PyAny::downcast::<PyInt>(o)?.extract()?;
-                    };
-
-                    if let Some(o) = kwargs.get_item("shuffle_partition_concurrency")? {
-                        ivf_params.shuffle_partition_concurrency =
-                            PyAny::downcast::<PyInt>(o)?.extract()?;
-                    };
+                    match (
+                        kwargs.get_item("precomputed_shuffle_buffers")?,
+                        kwargs.get_item("precomputed_shuffle_buffers_path")?
+                    ) {
+                        (Some(l), Some(p)) => {
+                            let path = Path::parse(p.to_string()).map_err(|e| {
+                                PyValueError::new_err(format!(
+                                    "Failed to parse precomputed_shuffle_buffers_path: {}",
+                                    e
+                                ))
+                            })?;
+                            let list = PyAny::downcast::<PyList>(l)?
+                                .iter()
+                                .map(|f| f.to_string())
+                                .collect();
+                            ivf_params.precomputed_shuffle_buffers = Some((path, list));
+                        },
+                        (None, None) => {},
+                        _ => {
+                            return Err(PyValueError::new_err(
+                                "precomputed_shuffle_buffers and precomputed_shuffle_buffers_path must be specified together."
+                            ))
+                        }
+                    }
                 }
                 Box::new(VectorIndexParams::with_ivf_pq_params(
                     m_type, ivf_params, pq_params,
@@ -807,39 +855,6 @@ impl Dataset {
         }
     }
 
-    fn count_unindexed_rows(&self, index_name: String) -> PyResult<Option<usize>> {
-        let idx = RT.block_on(None, self.ds.load_index_by_name(index_name.as_str()))?;
-        if let Some(index) = idx {
-            RT.block_on(
-                None,
-                self.ds
-                    .count_unindexed_rows(index.uuid.to_string().as_str()),
-            )?
-            .map_err(|err| PyIOError::new_err(err.to_string()))
-        } else {
-            Err(PyIOError::new_err(format!(
-                "Index {} not found",
-                index_name
-            )))
-        }
-    }
-
-    fn count_indexed_rows(&self, index_name: String) -> PyResult<Option<usize>> {
-        let idx = RT.block_on(None, self.ds.load_index_by_name(index_name.as_str()))?;
-        if let Some(index) = idx {
-            RT.block_on(
-                None,
-                self.ds.count_indexed_rows(index.uuid.to_string().as_str()),
-            )?
-            .map_err(|err| PyIOError::new_err(err.to_string()))
-        } else {
-            Err(PyIOError::new_err(format!(
-                "Index {} not found",
-                index_name
-            )))
-        }
-    }
-
     fn index_cache_entry_count(&self) -> PyResult<usize> {
         Ok(self.ds.index_cache_entry_count())
     }
@@ -855,18 +870,14 @@ impl Dataset {
         read_version: Option<u64>,
         commit_lock: Option<&PyAny>,
     ) -> PyResult<Self> {
-        let store_params = if let Some(commit_handler) = commit_lock {
-            let py_commit_lock = PyCommitLock::new(commit_handler.to_object(commit_handler.py()));
-            let mut object_store_params = ObjectStoreParams::default();
-            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
-            Some(object_store_params)
-        } else {
-            None
-        };
+        let commit_handler = commit_lock.map(|commit_lock| {
+            Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
+                as Arc<dyn CommitHandler>
+        });
         let ds = RT
             .block_on(
                 commit_lock.map(|cl| cl.py()),
-                LanceDataset::commit(dataset_uri, operation.0, read_version, store_params),
+                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler),
             )?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
@@ -917,14 +928,13 @@ fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
     }
 }
 
-pub fn get_object_store_params(options: &PyDict) -> Option<ObjectStoreParams> {
+pub fn get_commit_handler(options: &PyDict) -> Option<Arc<dyn CommitHandler>> {
     if options.is_none() {
         None
     } else if let Ok(Some(commit_handler)) = options.get_item("commit_handler") {
-        let py_commit_lock = PyCommitLock::new(commit_handler.to_object(options.py()));
-        let mut object_store_params = ObjectStoreParams::default();
-        object_store_params.set_commit_lock(Arc::new(py_commit_lock));
-        Some(object_store_params)
+        Some(Arc::new(PyCommitLock::new(
+            commit_handler.to_object(options.py()),
+        )))
     } else {
         None
     }
@@ -953,7 +963,7 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
             }
         }
 
-        p.store_params = get_object_store_params(options);
+        p.commit_handler = get_commit_handler(options);
 
         Some(p)
     };

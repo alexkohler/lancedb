@@ -16,15 +16,16 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use lance_core::{io::Writer, ROW_ID};
+use lance_core::{Error, Result, ROW_ID};
 use lance_index::vector::{ivf::shuffler::shuffle_dataset, pq::ProductQuantizer};
+use lance_io::{stream::RecordBatchStream, traits::Writer};
 use lance_linalg::distance::MetricType;
 
 use crate::index::vector::ivf::{io::write_index_partitions, Ivf};
-use crate::{io::RecordBatchStream, Error, Result};
 
 /// Build specific partitions of IVF index.
 ///
@@ -42,6 +43,7 @@ pub(super) async fn build_partitions(
     precomputed_partitons: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
+    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
@@ -75,10 +77,11 @@ pub(super) async fn build_partitions(
         pq.num_sub_vectors(),
         shuffle_partition_batches,
         shuffle_partition_concurrency,
+        precomputed_shuffle_buffers,
     )
     .await?;
 
-    write_index_partitions(writer, ivf, stream, None).await?;
+    write_index_partitions(writer, ivf, Some(stream), None).await?;
 
     Ok(())
 }

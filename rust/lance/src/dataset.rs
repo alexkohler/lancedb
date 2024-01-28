@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,13 +31,14 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
 use lance_core::datatypes::SchemaCompareOptions;
-use lance_core::io::{
-    commit::CommitError,
-    object_store::{ObjectStore, ObjectStoreParams},
-    read_metadata_offset, read_struct,
-    reader::{read_manifest, read_manifest_indexes},
-    write_manifest, ObjectWriter, WriteExt,
-};
+use lance_file::datatypes::populate_schema_dictionary;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_writer::ObjectWriter;
+use lance_io::traits::WriteExt;
+use lance_io::utils::{read_metadata_offset, read_struct};
+use lance_table::format::{Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION};
+use lance_table::io::commit::{commit_handler_from_url, CommitError, CommitHandler, CommitLock};
+use lance_table::io::manifest::{read_manifest, write_manifest};
 use log::warn;
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -69,18 +70,15 @@ use self::fragment::FileFragment;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::{reader_to_stream, write_fragments_internal};
-use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::error::box_error;
-use crate::format::{Fragment, Index, Manifest};
-use crate::index::DatasetIndexInternalExt;
 use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::session::Session;
-
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
+
 pub use write::update::{UpdateBuilder, UpdateJob};
 pub use write::{write_fragments, WriteMode, WriteParams};
 
@@ -94,6 +92,7 @@ pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 #[derive(Debug, Clone)]
 pub struct Dataset {
     pub(crate) object_store: Arc<ObjectStore>,
+    pub(crate) commit_handler: Arc<dyn CommitHandler>,
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) session: Arc<Session>,
@@ -138,6 +137,24 @@ pub struct ReadParams {
     pub session: Option<Arc<Session>>,
 
     pub store_options: Option<ObjectStoreParams>,
+
+    /// If present, dataset will use this to resolve the latest version
+    ///
+    /// Lance needs to be able to make atomic updates to the manifest.  This involves
+    /// coordination between readers and writers and we can usually rely on the filesystem
+    /// to do this coordination for us.
+    ///
+    /// Some filesystems (e.g. S3) do not support atomic operations.  In this case, for
+    /// safety, we recommend an external commit mechnaism (such as dynamodb) and, on the
+    /// read path, we need to reach out to that external mechanism to figure out the latest
+    /// version of the dataset.
+    ///
+    /// If this is not set then a default behavior is chosen that is appropriate for the
+    /// filesystem.
+    ///
+    /// If a custom object store is provided (via store_params.object_store) then this
+    /// must also be provided.
+    pub commit_handler: Option<Arc<dyn CommitHandler>>,
 }
 
 impl ReadParams {
@@ -158,6 +175,11 @@ impl ReadParams {
         self.session = Some(session);
         self
     }
+
+    /// Use the explicit locking to resolve the latest version
+    pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
+        self.commit_handler = Some(Arc::new(lock));
+    }
 }
 
 impl Default for ReadParams {
@@ -167,6 +189,7 @@ impl Default for ReadParams {
             metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
             session: None,
             store_options: None,
+            commit_handler: None,
         }
     }
 }
@@ -180,25 +203,53 @@ impl Dataset {
         DatasetBuilder::from_uri(uri).load().await
     }
 
-    /// Open a dataset with read params.
-    #[deprecated(since = "0.8.17", note = "Please use `DatasetBuilder` instead.")]
-    #[instrument(skip(params))]
-    pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
-        let (mut object_store, base_path) = match params.store_options.as_ref() {
+    async fn params_from_uri(
+        uri: &str,
+        commit_handler: &Option<Arc<dyn CommitHandler>>,
+        store_options: &Option<ObjectStoreParams>,
+    ) -> Result<(ObjectStore, Path, Arc<dyn CommitHandler>)> {
+        let (mut object_store, base_path) = match store_options.as_ref() {
             Some(store_options) => ObjectStore::from_uri_and_params(uri, store_options).await?,
             None => ObjectStore::from_uri(uri).await?,
         };
 
-        if let Some(block_size) = params
-            .store_options
-            .as_ref()
-            .and_then(|opts| opts.block_size)
-        {
+        if let Some(block_size) = store_options.as_ref().and_then(|opts| opts.block_size) {
             object_store.set_block_size(block_size);
         }
 
-        let latest_manifest = object_store
-            .commit_handler
+        let commit_handler = match &commit_handler {
+            None => {
+                if store_options.is_some() && store_options.as_ref().unwrap().object_store.is_some()
+                {
+                    return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: location!() });
+                }
+                commit_handler_from_url(uri, store_options).await?
+            }
+            Some(commit_handler) => {
+                if uri.starts_with("s3+ddb") {
+                    return Err(Error::InvalidInput {
+                        source:
+                            "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
+                                .into(),
+                        location: location!(),
+                    });
+                } else {
+                    commit_handler.clone()
+                }
+            }
+        };
+
+        Ok((object_store, base_path, commit_handler))
+    }
+
+    /// Open a dataset with read params.
+    #[deprecated(since = "0.8.17", note = "Please use `DatasetBuilder` instead.")]
+    #[instrument(skip(params))]
+    pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
+        let (object_store, base_path, commit_handler) =
+            Self::params_from_uri(uri, &params.commit_handler, &params.store_options).await?;
+
+        let latest_manifest = commit_handler
             .resolve_latest_version(&base_path, &object_store.inner)
             .await
             .map_err(|e| Error::DatasetNotFound {
@@ -221,6 +272,7 @@ impl Dataset {
             base_path.clone(),
             &latest_manifest,
             session,
+            commit_handler,
         )
         .await
     }
@@ -237,17 +289,10 @@ impl Dataset {
         version: u64,
         params: &ReadParams,
     ) -> Result<Self> {
-        let (mut object_store, base_path) = ObjectStore::from_uri(uri).await?;
-        if let Some(block_size) = params
-            .store_options
-            .as_ref()
-            .and_then(|opts| opts.block_size)
-        {
-            object_store.set_block_size(block_size);
-        };
+        let (object_store, base_path, commit_handler) =
+            Self::params_from_uri(uri, &params.commit_handler, &params.store_options).await?;
 
-        let manifest_file = object_store
-            .commit_handler
+        let manifest_file = commit_handler
             .resolve_version(&base_path, version, &object_store.inner)
             .await?;
 
@@ -259,14 +304,20 @@ impl Dataset {
                 params.metadata_cache_size,
             ))
         };
-        Self::checkout_manifest(Arc::new(object_store), base_path, &manifest_file, session).await
+        Self::checkout_manifest(
+            Arc::new(object_store),
+            base_path,
+            &manifest_file,
+            session,
+            commit_handler,
+        )
+        .await
     }
 
     /// Check out the specified version of this dataset
     pub async fn checkout_version(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
         let manifest_file = self
-            .object_store
             .commit_handler
             .resolve_version(&base_path, version, &self.object_store.inner)
             .await?;
@@ -275,6 +326,7 @@ impl Dataset {
             base_path,
             &manifest_file,
             self.session.clone(),
+            self.commit_handler.clone(),
         )
         .await
     }
@@ -284,6 +336,7 @@ impl Dataset {
         base_path: Path,
         manifest_path: &Path,
         session: Arc<Session>,
+        commit_handler: Arc<dyn CommitHandler>,
     ) -> Result<Self> {
         let object_reader = object_store
             .open(manifest_path)
@@ -325,14 +378,12 @@ impl Dataset {
             });
         }
 
-        manifest
-            .schema
-            .load_dictionary(object_reader.as_ref())
-            .await?;
+        populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
         Ok(Self {
             object_store,
             base: base_path,
             manifest: Arc::new(manifest),
+            commit_handler,
             session,
         })
     }
@@ -344,14 +395,11 @@ impl Dataset {
         params: Option<WriteParams>,
     ) -> Result<Self> {
         let mut params = params.unwrap_or_default();
-
-        let (object_store, base) =
-            ObjectStore::from_uri_and_params(uri, &params.store_params.clone().unwrap_or_default())
-                .await?;
+        let (object_store, base, commit_handler) =
+            Self::params_from_uri(uri, &params.commit_handler, &params.store_params).await?;
 
         // Read expected manifest path for the dataset
-        let dataset_exists = match object_store
-            .commit_handler
+        let dataset_exists = match commit_handler
             .resolve_latest_version(&base, &object_store.inner)
             .await
         {
@@ -392,6 +440,7 @@ impl Dataset {
                 DatasetBuilder::from_uri(uri)
                     .with_read_params(ReadParams {
                         store_options: params.store_params.clone(),
+                        commit_handler: params.commit_handler.clone(),
                         ..Default::default()
                     })
                     .load()
@@ -447,13 +496,21 @@ impl Dataset {
             commit_transaction(
                 dataset,
                 &object_store,
+                commit_handler.as_ref(),
                 &transaction,
                 &Default::default(),
                 &Default::default(),
             )
             .await?
         } else {
-            commit_new_dataset(&object_store, &base, &transaction, &Default::default()).await?
+            commit_new_dataset(
+                &object_store,
+                commit_handler.as_ref(),
+                &base,
+                &transaction,
+                &Default::default(),
+            )
+            .await?
         };
 
         Ok(Self {
@@ -461,6 +518,7 @@ impl Dataset {
             base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
+            commit_handler,
         })
     }
 
@@ -491,11 +549,13 @@ impl Dataset {
             ..params.unwrap_or_default()
         };
 
-        // Need to include params here because it might include a commit mechanism.
-        let object_store = Arc::new(
-            self.object_store()
-                .with_params(&params.store_params.clone().unwrap_or_default()),
-        );
+        if params.commit_handler.is_some() || params.store_params.is_some() {
+            return Err(Error::InvalidInput {
+                source: "commit_handler / store_params should not be specified when calling append"
+                    .into(),
+                location: location!(),
+            });
+        }
 
         let (stream, schema) = reader_to_stream(batches)?;
 
@@ -509,7 +569,7 @@ impl Dataset {
         )?;
 
         let fragments = write_fragments_internal(
-            object_store.clone(),
+            self.object_store.clone(),
             &self.base,
             &schema,
             stream,
@@ -522,7 +582,8 @@ impl Dataset {
 
         let new_manifest = commit_transaction(
             self,
-            &object_store,
+            &self.object_store,
+            self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -552,7 +613,6 @@ impl Dataset {
         read_manifest(
             &self.object_store,
             &self
-                .object_store
                 .commit_handler
                 .resolve_latest_version(&self.base, &self.object_store.inner)
                 .await?,
@@ -561,10 +621,7 @@ impl Dataset {
     }
 
     /// Restore the currently checked out version of the dataset as the latest version.
-    ///
-    /// Currently, `write_params` is just used to get additional store params.
-    /// Other options are ignored.
-    pub async fn restore(&mut self, write_params: Option<WriteParams>) -> Result<()> {
+    pub async fn restore(&mut self) -> Result<()> {
         let latest_manifest = self.latest_manifest().await?;
         let latest_version = latest_manifest.version;
 
@@ -576,17 +633,11 @@ impl Dataset {
             None,
         );
 
-        let object_store =
-            if let Some(store_params) = write_params.and_then(|params| params.store_params) {
-                Arc::new(self.object_store.with_params(&store_params))
-            } else {
-                self.object_store.clone()
-            };
-
         self.manifest = Arc::new(
             commit_transaction(
                 self,
-                &object_store,
+                &self.object_store,
+                self.commit_handler.as_ref(),
                 &transaction,
                 &Default::default(),
                 &Default::default(),
@@ -657,6 +708,7 @@ impl Dataset {
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
+        commit_handler: Option<Arc<dyn CommitHandler>>,
     ) -> Result<Self> {
         let read_version = read_version.map_or_else(
             || match operation {
@@ -669,13 +721,11 @@ impl Dataset {
             Ok,
         )?;
 
-        let (object_store, base) =
-            ObjectStore::from_uri_and_params(base_uri, &store_params.clone().unwrap_or_default())
-                .await?;
+        let (object_store, base, commit_handler) =
+            Self::params_from_uri(base_uri, &commit_handler, &store_params).await?;
 
         // Test if the dataset exists
-        let dataset_exists = match object_store
-            .commit_handler
+        let dataset_exists = match commit_handler
             .resolve_latest_version(&base, &object_store.inner)
             .await
         {
@@ -712,13 +762,21 @@ impl Dataset {
             commit_transaction(
                 dataset,
                 &object_store,
+                commit_handler.as_ref(),
                 &transaction,
                 &Default::default(),
                 &Default::default(),
             )
             .await?
         } else {
-            commit_new_dataset(&object_store, &base, &transaction, &Default::default()).await?
+            commit_new_dataset(
+                &object_store,
+                commit_handler.as_ref(),
+                &base,
+                &transaction,
+                &Default::default(),
+            )
+            .await?
         };
 
         Ok(Self {
@@ -726,6 +784,7 @@ impl Dataset {
             base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
+            commit_handler,
         })
     }
 
@@ -808,6 +867,7 @@ impl Dataset {
         let manifest = commit_transaction(
             self,
             &self.object_store,
+            self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -857,6 +917,7 @@ impl Dataset {
         let manifest = commit_transaction(
             self,
             &self.object_store,
+            self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -1240,6 +1301,7 @@ impl Dataset {
         let manifest = commit_transaction(
             self,
             &self.object_store,
+            self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -1263,9 +1325,8 @@ impl Dataset {
         &self.object_store
     }
 
-    async fn manifest_file(&self, version: u64) -> Result<Path> {
-        self.object_store
-            .commit_handler
+    pub(crate) async fn manifest_file(&self, version: u64) -> Result<Path> {
+        self.commit_handler
             .resolve_version(&self.base, version, &self.object_store.inner)
             .await
     }
@@ -1295,7 +1356,6 @@ impl Dataset {
     /// Get all versions.
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let mut versions: Vec<Version> = self
-            .object_store
             .commit_handler
             .list_manifests(&self.base, &self.object_store.inner)
             .await?
@@ -1318,8 +1378,7 @@ impl Dataset {
     /// This is meant to be a fast path for checking if a dataset has changed. This is why
     /// we don't return the full version struct.
     pub async fn latest_version_id(&self) -> Result<u64> {
-        self.object_store
-            .commit_handler
+        self.commit_handler
             .resolve_latest_version_id(&self.base, &self.object_store.inner)
             .await
     }
@@ -1356,94 +1415,6 @@ impl Dataset {
 
     pub(crate) fn fragments(&self) -> &Arc<Vec<Fragment>> {
         &self.manifest.fragments
-    }
-
-    /// Read all indices of this Dataset version.
-    pub async fn load_indices(&self) -> Result<Vec<Index>> {
-        let manifest_file = self.manifest_file(self.version().version).await?;
-        read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await
-    }
-
-    /// Loads a specific index with the given id
-    pub async fn load_index(&self, uuid: &str) -> Option<Index> {
-        self.load_indices()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|idx| idx.uuid.to_string() == uuid)
-    }
-
-    pub async fn load_index_by_name(&self, name: &str) -> Option<Index> {
-        self.load_indices()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|idx| idx.name == name)
-    }
-
-    pub(crate) async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<Index>> {
-        Ok(self
-            .load_indices()
-            .await?
-            .into_iter()
-            .filter(|idx| idx.fields.len() == 1)
-            .find(|idx| {
-                let field = self.schema().field_by_id(idx.fields[0]);
-                if let Some(field) = field {
-                    field.name == col
-                } else {
-                    false
-                }
-            }))
-    }
-
-    /// Find index with a given index_name and return its serialized statistics.
-    pub async fn index_statistics(&self, index_name: &str) -> Result<Option<String>> {
-        let index_uuid = self
-            .load_index_by_name(index_name)
-            .await
-            .map(|idx| idx.uuid.to_string());
-
-        if let Some(index_uuid) = index_uuid {
-            let index_statistics = self
-                .open_generic_index("vector", &index_uuid)
-                .await?
-                .statistics()
-                .unwrap();
-            Ok(Some(index_statistics))
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub async fn count_unindexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
-        let index = self.load_index(index_uuid).await;
-
-        if let Some(index) = index {
-            let unindexed_frags = unindexed_fragments(&index, self).await?;
-            let unindexed_rows = unindexed_frags
-                .iter()
-                .map(Fragment::num_rows)
-                // sum the number of rows in each fragment if no fragment returned None from row_count
-                .try_fold(0, |a, b| b.map(|b| a + b).ok_or(()));
-
-            Ok(unindexed_rows.ok())
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub async fn count_indexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
-        let count_rows = self.count_rows();
-        let count_unindexed_rows = self.count_unindexed_rows(index_uuid);
-
-        let (count_rows, count_unindexed_rows) =
-            futures::try_join!(count_rows, count_unindexed_rows)?;
-
-        match count_unindexed_rows {
-            Some(count_unindexed_rows) => Ok(Some(count_rows - count_unindexed_rows)),
-            None => Ok(None),
-        }
     }
 
     /// Gets the number of files that are so small they don't even have a full
@@ -1512,6 +1483,7 @@ impl Default for ManifestWriteConfig {
 /// Commit a manifest file and create a copy at the latest manifest path.
 pub(crate) async fn write_manifest_file(
     object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
     base_path: &Path,
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
@@ -1524,8 +1496,7 @@ pub(crate) async fn write_manifest_file(
 
     manifest.update_max_fragment_id();
 
-    object_store
-        .commit_handler
+    commit_handler
         .commit(
             manifest,
             indices,
@@ -1547,7 +1518,9 @@ fn write_manifest_file_to_path<'a>(
     Box::pin(async {
         let mut object_writer = ObjectWriter::new(object_store, path).await?;
         let pos = write_manifest(&mut object_writer, manifest, indices).await?;
-        object_writer.write_magics(pos).await?;
+        object_writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await?;
         object_writer.shutdown().await?;
         Ok(())
     })
@@ -1592,9 +1565,9 @@ mod tests {
     use crate::dataset::WriteMode::Overwrite;
     use crate::datatypes::Schema;
     use crate::index::scalar::ScalarIndexParams;
-    use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
-    use crate::io::deletion::read_deletion_file;
+    use crate::index::vector::VectorIndexParams;
 
+    use arrow_array::FixedSizeListArray;
     use arrow_array::{
         builder::StringDictionaryBuilder,
         cast::{as_string_array, as_struct_array},
@@ -1607,12 +1580,14 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
-    use lance_core::format::WriterVersion;
+    use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_datagen::{array, gen, BatchCount, RowCount};
-    use lance_index::vector::DIST_COL;
-    use lance_index::IndexType;
+    use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
+    use lance_table::format::WriterVersion;
+    use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;
+    use pretty_assertions::assert_eq;
     use tempfile::{tempdir, TempDir};
 
     // Used to validate that futures returned are Send.
@@ -1860,7 +1835,6 @@ mod tests {
         let manifest = read_manifest(
             dataset.object_store(),
             &dataset
-                .object_store()
                 .commit_handler
                 .resolve_latest_version(&dataset.base, &dataset.object_store().inner)
                 .await
@@ -1879,7 +1853,6 @@ mod tests {
         let mut manifest = read_manifest(
             dataset.object_store(),
             &dataset
-                .object_store()
                 .commit_handler
                 .resolve_latest_version(&dataset.base, &dataset.object_store().inner)
                 .await
@@ -1902,6 +1875,7 @@ mod tests {
         manifest.version += 1;
         write_manifest_file(
             dataset.object_store(),
+            dataset.commit_handler.as_ref(),
             &dataset.base,
             &mut manifest,
             None,
@@ -2546,24 +2520,19 @@ mod tests {
         assert_eq!(fragment_bitmap.len(), 1);
         assert!(fragment_bitmap.contains(0));
 
-        let actual_statistics: serde_json::value::Value = serde_json::from_str(
-            &dataset
-                .index_statistics("embeddings_idx")
-                .await
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+        let actual_statistics: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("embeddings_idx").await.unwrap())
+                .unwrap();
         let actual_statistics = actual_statistics.as_object().unwrap();
         assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF");
-        assert_eq!(actual_statistics["metric_type"].as_str().unwrap(), "l2");
-        assert_eq!(actual_statistics["num_partitions"].as_i64().unwrap(), 10);
 
-        assert_eq!(
-            dataset.index_statistics("non-existent_idx").await.unwrap(),
-            None
-        );
-        assert_eq!(dataset.index_statistics("").await.unwrap(), None);
+        let deltas = actual_statistics["indices"].as_array().unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["metric_type"].as_str().unwrap(), "l2");
+        assert_eq!(deltas[0]["num_partitions"].as_i64().unwrap(), 10);
+
+        assert!(dataset.index_statistics("non-existent_idx").await.is_err());
+        assert!(dataset.index_statistics("").await.is_err());
 
         // Overwrite should invalidate index
         let write_params = WriteParams {
@@ -2612,11 +2581,12 @@ mod tests {
             .await
             .unwrap();
 
-        let index = dataset.load_index_by_name(&index_name).await.unwrap();
+        let indices = dataset.load_indices_by_name(&index_name).await.unwrap();
 
-        assert_eq!(index.dataset_version, 1);
-        assert_eq!(index.fields, vec![0]);
-        assert_eq!(index.name, index_name);
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 1);
+        assert_eq!(indices[0].fields, vec![0]);
+        assert_eq!(indices[0].name, index_name);
 
         dataset.index_statistics(&index_name).await.unwrap();
     }
@@ -3268,7 +3238,7 @@ mod tests {
         assert_eq!(dataset.manifest, original_manifest);
 
         // Restore to a previous version
-        dataset.restore(None).await.unwrap();
+        dataset.restore().await.unwrap();
         assert_eq!(dataset.manifest.version, 3);
         assert_eq!(dataset.manifest.fragments, original_manifest.fragments);
         assert_eq!(dataset.manifest.schema, original_manifest.schema);
@@ -3430,87 +3400,6 @@ mod tests {
                 &Field::new(DIST_COL, DataType::Float32, true)
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_count_index_rows() {
-        let test_dir = tempdir().unwrap();
-        let dimensions = 16;
-        let column_name = "vec";
-        let field = Field::new(
-            column_name,
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                dimensions,
-            ),
-            false,
-        );
-        let schema = Arc::new(ArrowSchema::new(vec![field]));
-
-        let float_arr = generate_random_array(512 * dimensions as usize);
-
-        let vectors =
-            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
-
-        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
-
-        let reader =
-            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
-
-        let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-        dataset.validate().await.unwrap();
-
-        // Make sure it returns None if there's no index with the passed identifier
-        assert_eq!(dataset.count_unindexed_rows("bad_id").await.unwrap(), None);
-        assert_eq!(dataset.count_indexed_rows("bad_id").await.unwrap(), None);
-
-        // Create an index
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 10);
-        dataset
-            .create_index(
-                &[column_name],
-                IndexType::Vector,
-                Some("vec_idx".into()),
-                &params,
-                true,
-            )
-            .await
-            .unwrap();
-
-        let index = dataset.load_index_by_name("vec_idx").await.unwrap();
-        let index_uuid = &index.uuid.to_string();
-
-        // Make sure there are no unindexed rows
-        assert_eq!(
-            dataset.count_unindexed_rows(index_uuid).await.unwrap(),
-            Some(0)
-        );
-        assert_eq!(
-            dataset.count_indexed_rows(index_uuid).await.unwrap(),
-            Some(512)
-        );
-
-        // Now we'll append some rows which shouldn't be indexed and see the
-        // count change
-        let float_arr = generate_random_array(512 * dimensions as usize);
-        let vectors =
-            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
-
-        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
-
-        let reader = RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema);
-        dataset.append(reader, None).await.unwrap();
-
-        // Make sure the new rows are not indexed
-        assert_eq!(
-            dataset.count_unindexed_rows(index_uuid).await.unwrap(),
-            Some(512)
-        );
-        assert_eq!(
-            dataset.count_indexed_rows(index_uuid).await.unwrap(),
-            Some(512)
-        );
     }
 
     #[tokio::test]
@@ -3891,14 +3780,14 @@ mod tests {
         // Any transaction, no matter how simple, should trigger the fragment bitmap to be recalculated
         dataset.append(data, None).await.unwrap();
 
-        for idx in dataset.load_indices().await.unwrap() {
+        for idx in dataset.load_indices().await.unwrap().iter() {
             // The corrupt fragment_bitmap does not contain 0 but the
             // restored one should
-            assert!(idx.fragment_bitmap.unwrap().contains(0));
+            assert!(idx.fragment_bitmap.as_ref().unwrap().contains(0));
         }
 
         let mut dataset = dataset.checkout_version(broken_version).await.unwrap();
-        dataset.restore(None).await.unwrap();
+        dataset.restore().await.unwrap();
 
         // Running compaction right away should work (this is verifying compaction
         // is not broken by the potentially malformed fragment bitmaps)
@@ -3906,8 +3795,8 @@ mod tests {
             .await
             .unwrap();
 
-        for idx in dataset.load_indices().await.unwrap() {
-            assert!(idx.fragment_bitmap.unwrap().contains(0));
+        for idx in dataset.load_indices().await.unwrap().iter() {
+            assert!(idx.fragment_bitmap.as_ref().unwrap().contains(0));
         }
 
         let mut scan = dataset.scan();
@@ -3926,5 +3815,45 @@ mod tests {
 
         let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
         assert_eq!(row_count, 1900);
+    }
+
+    #[tokio::test]
+    async fn test_bfloat16_roundtrip() -> Result<()> {
+        let inner_field = Arc::new(
+            Field::new("item", DataType::FixedSizeBinary(2), true).with_metadata(
+                [
+                    (ARROW_EXT_NAME_KEY.into(), BFLOAT16_EXT_NAME.into()),
+                    (ARROW_EXT_META_KEY.into(), "".into()),
+                ]
+                .into(),
+            ),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "fsl",
+            DataType::FixedSizeList(inner_field.clone(), 2),
+            false,
+        )]));
+
+        let values = bfloat16::BFloat16Array::from_iter_values(
+            (0..6).map(|i| i as f32).map(half::bf16::from_f32),
+        );
+        let vectors = FixedSizeListArray::new(inner_field, 2, Arc::new(values.into_inner()), None);
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            test_uri,
+            None,
+        )
+        .await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(batch, data);
+
+        Ok(())
     }
 }
