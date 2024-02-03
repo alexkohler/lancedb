@@ -23,7 +23,6 @@ import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from functools import lru_cache
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -42,11 +41,23 @@ import pyarrow as pa
 import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 
-from .dependencies import _check_for_numpy, _check_for_pandas, torch
+from .dependencies import (
+    _check_for_hugging_face,
+    _check_for_numpy,
+    _check_for_pandas,
+    torch,
+)
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
-from .lance import CleanupStats, _Dataset, _Operation, _Scanner, _write_dataset
+from .lance import (
+    CleanupStats,
+    _Dataset,
+    _MergeInsertBuilder,
+    _Operation,
+    _Scanner,
+    _write_dataset,
+)
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .optimize import Compaction
@@ -74,6 +85,62 @@ if TYPE_CHECKING:
         np.ndarray,
         Iterable[float],
     ]
+
+
+class MergeInsertBuilder(_MergeInsertBuilder):
+    def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
+        """Executes the merge insert operation
+
+        There is no return value but the original dataset will be updated.
+
+        Parameters
+        ----------
+
+        data_obj: ReaderLike
+            The new data to use as the source table for the operation.  This parameter
+            can be any source of data (e.g. table / dataset) that
+            :func:`~lance.write_dataset` accepts.
+        schema: Optional[pa.Schema]
+            The schema of the data.  This only needs to be supplied whenever the data
+            source is some kind of generator.
+        """
+        reader = _coerce_reader(data_obj, schema)
+        super(MergeInsertBuilder, self).execute(reader)
+
+    # These next three overrides exist only to document the methods
+
+    def when_matched_update_all(self):
+        """
+        Configure the operation to update matched rows
+
+        After this method is called, when the merge insert operation executes,
+        any rows that match both the source table and the target table will be
+        updated.  The rows from the target table will be removed and the rows
+        from the source table will be added.
+        """
+        return super(MergeInsertBuilder, self).when_matched_update_all()
+
+    def when_not_matched_insert_all(self):
+        """
+        Configure the operation to insert not matched rows
+
+        After this method is called, when the merge insert operation executes,
+        any rows that exist only in the source table will be inserted into
+        the target table.
+        """
+        return super(MergeInsertBuilder, self).when_not_matched_insert_all()
+
+    def when_not_matched_by_source_delete(self, expr: Optional[str] = None):
+        """
+        Configure the operation to delete source rows that do not match
+
+        After this method is called, when the merge insert operation executes,
+        any rows that exist only in the target table will be deleted.  An
+        optional filter can be specified to limit the scope of the delete
+        operation.  If given (as an SQL filter) then only rows which match
+        the filter will be deleted.
+        """
+        return super(MergeInsertBuilder, self).when_not_matched_by_source_delete(expr)
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -114,9 +181,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._uri
 
-    @lru_cache(maxsize=None)
     def list_indices(self) -> List[Dict[str, Any]]:
-        return self._ds.load_indices()
+        if getattr(self, "_list_indices_res", None) is None:
+            self._list_indices_res = self._ds.load_indices()
+        return self._list_indices_res
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
@@ -625,6 +693,66 @@ class LanceDataset(pa.dataset.Dataset):
             predicate = str(predicate)
         self._ds.delete(predicate)
 
+    def merge_insert(
+        self,
+        on: Union[str, Iterable[str]],
+    ):
+        """
+        Returns a builder that can be used to create a "merge insert" operation
+
+        This operation can add rows, update rows, and remove rows in a single
+        transaction. It is a very generic tool that can be used to create
+        behaviors like "insert if not exists", "update or insert (i.e. upsert)",
+        or even replace a portion of existing data with new data (e.g. replace
+        all data where month="january")
+
+        The merge insert operation works by combining new data from a
+        **source table** with existing data in a **target table** by using a
+        join.  There are three categories of records.
+
+        "Matched" records are records that exist in both the source table and
+        the target table. "Not matched" records exist only in the source table
+        (e.g. these are new data). "Not matched by source" records exist only
+        in the target table (this is old data).
+
+        The builder returned by this method can be used to customize what
+        should happen for each category of data.
+
+        Please note that the data will be reordered as part of this
+        operation.  This is because updated rows will be deleted from the
+        dataset and then reinserted at the end with the new values.  The
+        order of the newly inserted rows may fluctuate randomly because a
+        hash-join operation is used internally.
+
+        Parameters
+        ----------
+
+        on: Union[str, Iterable[str]]
+            A column (or columns) to join on.  This is how records from the
+            source table and target table are matched.  Typically this is some
+            kind of key or id column.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [2, 1, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> new_table = pa.table({"a": [2, 3, 4], "b": ["x", "y", "z"]})
+        >>> # Perform a "upsert" operation
+        >>> dataset.merge_insert("a")             \\
+        ...        .when_matched_update_all()     \\
+        ...        .when_not_matched_insert_all() \\
+        ...        .execute(new_table)
+        >>> dataset.to_table().sort_by("a").to_pandas()
+           a  b
+        0  1  b
+        1  2  x
+        2  3  y
+        3  4  z
+        """
+        return MergeInsertBuilder(self._ds, on)
+
     def update(
         self,
         updates: Dict[str, str],
@@ -863,12 +991,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         index_type = index_type.upper()
         if index_type != "BTREE":
-            raise NotImplementedError(
-                (
-                    'Only "BTREE" is supported for ',
-                    f"index_type.  Received {index_type}",
-                )
-            )
+            raise NotImplementedError((
+                'Only "BTREE" is supported for ',
+                f"index_type.  Received {index_type}",
+            ))
 
         self._ds.create_index([column], index_type, name, replace)
 
@@ -1547,6 +1673,7 @@ class ScannerBuilder:
         self.ds = ds
         self._limit = 0
         self._filter = None
+        self._substrait_filter = None
         self._prefilter = None
         self._offset = None
         self._columns = None
@@ -1607,8 +1734,38 @@ class ScannerBuilder:
 
     def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
         if isinstance(filter, pa.compute.Expression):
-            filter = str(filter)
-        self._filter = filter
+            try:
+                from pyarrow.substrait import serialize_expressions
+
+                fields_without_lists = []
+                counter = 0
+                # Pyarrow cannot handle fixed size lists when converting
+                # types to Substrait. So we can't use those in our filter,
+                # which is ok for now but we need to replace them with some
+                # kind of placeholder because Substrait is going to use
+                # ordinal field references and we want to make sure those are
+                # correct.
+                for field in self.ds.schema:
+                    if pa.types.is_fixed_size_list(field.type):
+                        pos = counter
+                        counter += 1
+                        fields_without_lists.append(
+                            pa.field(f"__unlikely_name_placeholder_{pos}", pa.int8())
+                        )
+                    else:
+                        fields_without_lists.append(field)
+                # Serialize the pyarrow compute expression toSubstrait and use
+                # that as a filter.
+                scalar_schema = pa.schema(fields_without_lists)
+                self._substrait_filter = serialize_expressions(
+                    [filter], ["my_filter"], scalar_schema
+                )
+            except ImportError:
+                # serialize_expressions was introduced in pyarrow 14.  Fallback to
+                # stringifying the expression if pyarrow is too old
+                self._filter = str(filter)
+        else:
+            self._filter = filter
         return self
 
     def prefilter(self, prefilter: bool) -> ScannerBuilder:
@@ -1709,6 +1866,7 @@ class ScannerBuilder:
             self._fragments,
             self._with_row_id,
             self._use_stats,
+            self._substrait_filter,
         )
         return LanceScanner(scanner, self.ds)
 
@@ -1960,6 +2118,7 @@ def write_dataset(
     data_obj: Reader-like
         The data to be written. Acceptable types are:
         - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
+        - Huggingface dataset
     uri: str or Path
         Where to write the dataset to (directory)
     schema: Schema, optional
@@ -1988,6 +2147,15 @@ def write_dataset(
         a custom class that defines hooks to be called when each fragment is
         starting to write and finishing writing.
     """
+    if _check_for_hugging_face(data_obj):
+        # Huggingface datasets
+        from .dependencies import datasets
+
+        if isinstance(data_obj, datasets.Dataset):
+            if schema is None:
+                schema = data_obj.features.arrow_schema
+            data_obj = data_obj.data.to_batches()
+
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
     # TODO add support for passing in LanceDataset and LanceScanner here

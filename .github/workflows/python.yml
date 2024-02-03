@@ -50,8 +50,8 @@ jobs:
         pip install torch --index-url https://download.pytorch.org/whl/cpu
     - name: Lint Python
       run: |
-        ruff format --check python
-        ruff check python
+        ruff format --preview --check python
+        ruff check --preview python
     - name: Install dependencies
       run: |
         sudo apt update
@@ -136,10 +136,7 @@ jobs:
       run: sudo rm -rf target/wheels
   mac:
     timeout-minutes: 45
-    strategy:
-      matrix:
-        mac-runner: [ "macos-13-xlarge" ]
-    runs-on: "${{ matrix.mac-runner }}"
+    runs-on: "macos-14"
     defaults:
       run:
         shell: bash
