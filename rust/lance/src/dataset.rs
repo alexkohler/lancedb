@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Lance Dataset
 //!
@@ -44,6 +33,7 @@ use lance_table::io::commit::{commit_handler_from_url, CommitError, CommitHandle
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use log::warn;
 use object_store::path::Path;
+use prost::Message;
 use snafu::{location, Location};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
@@ -483,9 +473,15 @@ impl Dataset {
         }
 
         let object_store = Arc::new(object_store);
-        let fragments =
-            write_fragments_internal(object_store.clone(), &base, &schema, stream, params.clone())
-                .await?;
+        let fragments = write_fragments_internal(
+            dataset.as_ref(),
+            object_store.clone(),
+            &base,
+            &schema,
+            stream,
+            params.clone(),
+        )
+        .await?;
 
         let operation = match params.mode {
             WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
@@ -575,6 +571,7 @@ impl Dataset {
         )?;
 
         let fragments = write_fragments_internal(
+            Some(self),
             self.object_store.clone(),
             &self.base,
             &schema,
@@ -615,6 +612,16 @@ impl Dataset {
         self.append_impl(batches, params).await
     }
 
+    /// Get the base URI of the dataset.
+    pub fn uri(&self) -> &Path {
+        &self.base
+    }
+
+    /// Get the full manifest of the dataset version.
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
     pub async fn latest_manifest(&self) -> Result<Manifest> {
         read_manifest(
             &self.object_store,
@@ -624,6 +631,20 @@ impl Dataset {
                 .await?,
         )
         .await
+    }
+
+    /// Read the transaction file for this version of the dataset.
+    ///
+    /// If there was no transaction file written for this version of the dataset
+    /// then this will return None.
+    pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
+        let path = match &self.manifest.transaction_file {
+            Some(path) => self.base.child("_transactions").child(path.as_str()),
+            None => return Ok(None),
+        };
+        let data = self.object_store.inner.get(&path).await?.bytes().await?;
+        let transaction = lance_table::format::pb::Transaction::decode(data)?;
+        Transaction::try_from(&transaction).map(Some)
     }
 
     /// Restore the currently checked out version of the dataset as the latest version.
@@ -692,6 +713,8 @@ impl Dataset {
     ///
     /// This method can be used to commit this change to the dataset's manifest.  This method will
     /// not verify that the provided fragments exist and correct, that is the caller's responsibility.
+    /// Some validation can be performed using the function
+    /// [crate::dataset::transaction::validate_operation].
     ///
     /// If this commit is a change to an existing dataset then it will often need to be based on an
     /// existing version of the dataset.  For example, if this change is a `delete` operation then
@@ -849,7 +872,8 @@ impl Dataset {
         let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
-        let new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+        let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+        new_schema.set_field_id(Some(self.manifest.max_field_id()));
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
@@ -914,14 +938,24 @@ impl Dataset {
     ///
     /// It offers a fast path of counting rows by just computing via metadata.
     #[instrument(skip_all)]
-    pub async fn count_rows(&self) -> Result<usize> {
-        // Open file to read metadata.
-        let counts = stream::iter(self.get_fragments())
-            .map(|f| async move { f.count_rows().await })
-            .buffer_unordered(16)
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(counts.iter().sum())
+    pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
+        // TODO: consolidate the count_rows into Scanner plan.
+        if let Some(filter) = filter {
+            let mut scanner = self.scan();
+            scanner.filter(&filter)?;
+            Ok(scanner
+                .project::<String>(&[])?
+                .with_row_id() // TODO: fix scan plan to not require row_id for count_rows.
+                .count_rows()
+                .await? as usize)
+        } else {
+            let cnts = stream::iter(self.get_fragments())
+                .map(|f| async move { f.count_rows().await })
+                .buffer_unordered(16)
+                .try_collect::<Vec<_>>()
+                .await?;
+            Ok(cnts.iter().sum())
+        }
     }
 
     #[instrument(skip_all, fields(num_rows=row_indices.len()))]
@@ -1076,7 +1110,7 @@ impl Dataset {
             })?;
 
             let reader = fragment.open(projection.as_ref(), false).await?;
-            reader.read_range(range).await
+            reader.legacy_read_range_as_batch(range).await
         } else if row_id_meta.sorted {
             // Don't need to re-arrange data, just concatenate
 
@@ -1106,8 +1140,8 @@ impl Dataset {
                 let fragment = self.get_fragment(fragment_id as usize).ok_or_else(|| {
                     Error::invalid_input(
                         format!(
-                            "row_id belongs to non-existant fragment: {}",
-                            row_ids[current_start]
+                            "row_id {} belongs to non-existant fragment: {}",
+                            row_ids[range.start], fragment_id
                         ),
                         location!(),
                     )
@@ -1235,7 +1269,7 @@ impl Dataset {
     /// Sample `n` rows from the dataset.
     pub(crate) async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
-        let num_rows = self.count_rows().await?;
+        let num_rows = self.count_rows(None).await?;
         let ids = (0..num_rows as u64).choose_multiple(&mut rand::thread_rng(), n);
         self.take(&ids, projection).await
     }
@@ -1640,7 +1674,8 @@ impl Dataset {
             }
         }
 
-        let schema = self.schema().merge(output_schema.as_ref())?;
+        let mut schema = self.schema().merge(output_schema.as_ref())?;
+        schema.set_field_id(Some(self.manifest.max_field_id()));
 
         let fragments = self
             .add_columns_impl(read_columns, mapper, result_checkpoint, None)
@@ -1739,7 +1774,7 @@ impl Dataset {
         // Mapping of old to new fields that need to be casted.
         let mut cast_fields: Vec<(Field, Field)> = Vec::new();
 
-        let mut next_field_id = new_schema.max_field_id().unwrap_or_default() + 1;
+        let mut next_field_id = self.manifest.max_field_id() + 1;
 
         for alteration in alterations {
             let field_src = self.schema().field(&alteration.path).ok_or_else(|| {
@@ -1767,7 +1802,7 @@ impl Dataset {
 
             let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
             if let Some(rename) = &alteration.rename {
-                field_dest.name = rename.clone();
+                field_dest.name.clone_from(rename);
             }
             if let Some(nullable) = alteration.nullable {
                 field_dest.nullable = nullable;
@@ -1857,6 +1892,21 @@ impl Dataset {
                     Some((new_col_schema, new_schema.clone())),
                 )
                 .await?;
+
+            // Some data files may no longer contain any columns in the dataset (e.g. if every
+            // remaining column has been altered into a different data file) and so we remove them
+            let schema_field_ids = new_schema.field_ids().into_iter().collect::<Vec<_>>();
+            let fragments = fragments
+                .into_iter()
+                .map(|mut frag| {
+                    frag.files.retain(|f| {
+                        f.fields
+                            .iter()
+                            .any(|field| schema_field_ids.contains(field))
+                    });
+                    frag
+                })
+                .collect::<Vec<_>>();
 
             Transaction::new(
                 self.manifest.version,
@@ -2024,8 +2074,6 @@ fn check_row_ids(row_ids: &[u64]) -> RowIdMeta {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::ops::Range;
     use std::sync::Mutex;
     use std::vec;
 
@@ -2033,24 +2081,18 @@ mod tests {
     use crate::arrow::FixedSizeListArrayExt;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::WriteMode::Overwrite;
-    use crate::datatypes::Schema;
     use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
 
     use arrow_array::types::Int64Type;
     use arrow_array::{
-        builder::StringDictionaryBuilder,
-        cast::{as_string_array, as_struct_array},
-        types::Int32Type,
-        ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
-        Int8DictionaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
-        UInt32Array,
+        builder::StringDictionaryBuilder, cast::as_string_array, types::Int32Type, ArrayRef,
+        DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
+        RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
     };
     use arrow_array::{FixedSizeListArray, Float16Array, Float64Array, ListArray};
     use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
-    use arrow_select::take::take;
-    use futures::stream::TryStreamExt;
+    use arrow_schema::{Field, Fields as ArrowFields, Schema as ArrowSchema};
     use half::f16;
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_datagen::{array, gen, BatchCount, RowCount};
@@ -2172,12 +2214,15 @@ mod tests {
             DataType::Int32,
             false,
         )]));
-        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
+        let i32_array: ArrayRef = Arc::new(Int32Array::new(vec![].into(), None));
+        let batch = RecordBatch::try_from_iter(vec![("i", i32_array)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         // check schema of reader and original is same
         assert_eq!(schema.as_ref(), reader.schema().as_ref());
         let result = Dataset::write(reader, test_uri, None).await.unwrap();
+
         // check dataset empty
-        assert_eq!(result.count_rows().await.unwrap(), 0);
+        assert_eq!(result.count_rows(None).await.unwrap(), 0);
         // Since the dataset is empty, will return None.
         assert_eq!(result.manifest.max_fragment_id(), None);
 
@@ -2217,7 +2262,7 @@ mod tests {
         let actual_schema = ArrowSchema::from(actual_ds.schema());
         assert_eq!(&actual_schema, schema.as_ref());
         // check num rows is 10
-        assert_eq!(actual_ds.count_rows().await.unwrap(), 10);
+        assert_eq!(actual_ds.count_rows(None).await.unwrap(), 10);
         // Max fragment id is still 0 since we only have 1 fragment.
         assert_eq!(actual_ds.manifest.max_fragment_id(), Some(0));
         // check expected batch is correct
@@ -2237,6 +2282,26 @@ mod tests {
         let sorted_arr = take(&struct_arr, &sorted_indices, None).unwrap();
         let expected_struct_arr: StructArray = expected_batch.into();
         assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
+    }
+
+    #[lance_test_macros::test(tokio::test)]
+    async fn test_create_with_empty_iter() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
+        // check schema of reader and original is same
+        assert_eq!(schema.as_ref(), reader.schema().as_ref());
+        let result = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // check dataset empty
+        assert_eq!(result.count_rows(None).await.unwrap(), 0);
+        // Since the dataset is empty, will return None.
+        assert_eq!(result.manifest.max_fragment_id(), None);
     }
 
     #[tokio::test]
@@ -2267,7 +2332,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(dataset.count_rows().await.unwrap(), num_rows);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), num_rows);
 
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 10);
@@ -2275,9 +2340,9 @@ mod tests {
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
             let reader = fragment.open(dataset.schema(), false).await.unwrap();
-            assert_eq!(reader.num_batches(), 10);
-            for i in 0..reader.num_batches() {
-                assert_eq!(reader.num_rows_in_batch(i), 10);
+            assert_eq!(reader.legacy_num_batches(), 10);
+            for i in 0..reader.legacy_num_batches() {
+                assert_eq!(reader.legacy_num_rows_in_batch(i), 10);
             }
         }
     }
@@ -2771,7 +2836,7 @@ mod tests {
             .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.count_rows().await.unwrap(), 400);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
         let projection = Schema::try_from(schema.as_ref()).unwrap();
         let values = dataset
             .take(
@@ -2840,7 +2905,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(dataset.count_rows().await.unwrap(), 400);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
         let projection = Schema::try_from(schema.as_ref()).unwrap();
         let indices = &[
             5_u64 << 32,        // 200
@@ -2919,9 +2984,16 @@ mod tests {
             .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(10, dataset.fragments().len());
-        assert_eq!(400, dataset.count_rows().await.unwrap());
         dataset.validate().await.unwrap();
+        assert_eq!(10, dataset.fragments().len());
+        assert_eq!(400, dataset.count_rows(None).await.unwrap());
+        assert_eq!(
+            200,
+            dataset
+                .count_rows(Some("i < 200".to_string()))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3175,6 +3247,101 @@ mod tests {
 
         assert_eq!(dataset.version().version, 3);
         assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_drop_add_columns() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
+
+        let test_dir = tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 0);
+
+        // Test we can add 1 column, drop it, then add another column. Validate
+        // the field ids are as expected.
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("x".into(), "i + 1".into())]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 1);
+
+        dataset.drop_columns(&["x"]).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 0);
+
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("y".into(), "2 * i".into())]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 1);
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_data = RecordBatch::try_new(
+            Arc::new(schema.try_with_column(Field::new("y", DataType::Int32, false))?),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![2, 4])),
+            ],
+        )?;
+        assert_eq!(data, expected_data);
+        dataset.drop_columns(&["y"]).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 0);
+
+        // Test we can add 2 columns, drop 1, then add another column. Validate
+        // the field ids are as expected.
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![
+                    ("a".into(), "i + 3".into()),
+                    ("b".into(), "i + 7".into()),
+                ]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 2);
+
+        dataset.drop_columns(&["b"]).await?;
+        // Even though we dropped a column, we still have the fragment with a and
+        // b. So it should still act as if that field id is still in play.
+        assert_eq!(dataset.manifest.max_field_id(), 2);
+
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("c".into(), "i + 11".into())]),
+                Some(vec!["i".into()]),
+            )
+            .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 3);
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+            Field::new("c", DataType::Int32, false),
+        ]));
+        let expected_data = RecordBatch::try_new(
+            expected_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![4, 5])),
+                Arc::new(Int32Array::from(vec![12, 13])),
+            ],
+        )?;
+        assert_eq!(data, expected_data);
 
         Ok(())
     }
@@ -3851,7 +4018,7 @@ mod tests {
 
         // Assert num rows, deletions, and physical rows are all correct.
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.count_rows().await.unwrap(), 90);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 90);
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
         let total_physical_rows = futures::stream::iter(dataset.get_fragments())
             .then(|f| async move { f.physical_rows().await })
@@ -3877,7 +4044,7 @@ mod tests {
             .unwrap();
 
         // Assert num rows, deletions, and physical rows are all correct.
-        assert_eq!(dataset.count_rows().await.unwrap(), 95);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 95);
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
         let total_physical_rows = futures::stream::iter(dataset.get_fragments())
             .then(|f| async move { f.physical_rows().await })
@@ -3920,7 +4087,7 @@ mod tests {
         // Assert num rows, deletions, and physical rows are all correct, even
         // though stats are bad.
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.count_rows().await.unwrap(), 92);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 92);
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
         let total_physical_rows = futures::stream::iter(dataset.get_fragments())
             .then(|f| async move { f.physical_rows().await })
@@ -3963,7 +4130,7 @@ mod tests {
             })
             .collect();
         assert_eq!(num_deletions, vec![Some(10), None, None]);
-        assert_eq!(dataset.count_rows().await.unwrap(), 97);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 97);
 
         // Scan data and assert it is as expected.
         let expected = RecordBatch::try_new(
@@ -4066,6 +4233,45 @@ mod tests {
 
         let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
         assert_eq!(row_count, 1900);
+    }
+
+    #[tokio::test]
+    async fn test_fix_v0_10_5_corrupt_schema() {
+        // Schemas could be corrupted by successive calls to `add_columns` and
+        // `drop_columns`. We should be able to detect this by checking for
+        // duplicate field ids. We should be able to fix this in new commits
+        // by dropping unused data files and re-writing the schema.
+
+        // Copy over table
+        let test_dir = copy_test_data_to_tmp("v0.10.5/corrupt_schema").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+
+        let validate_res = dataset.validate().await;
+        assert!(validate_res.is_err());
+
+        // Force a migration.
+        dataset.delete("false").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            data["b"]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[0, 4, 8, 12]
+        );
+        assert_eq!(
+            data["c"]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[0, 5, 10, 15]
+        );
     }
 
     #[tokio::test]
@@ -4686,9 +4892,9 @@ mod tests {
         let indices = dataset.load_indices().await?;
         assert_eq!(indices.len(), 0);
 
-        // Each fragment gains a file with the new columns
+        // Each fragment gains a file with the new columns, but then the original file is dropped
         dataset.fragments().iter().for_each(|f| {
-            assert_eq!(f.files.len(), 5);
+            assert_eq!(f.files.len(), 4);
         });
 
         let expected_data = RecordBatch::try_new(
@@ -4715,5 +4921,19 @@ mod tests {
         assert_eq!(actual_data, expected_data);
 
         Ok(())
+    }
+
+    // Bug: https://github.com/lancedb/lancedb/issues/1223
+    #[tokio::test]
+    async fn test_open_nonexisting_dataset() {
+        let test_dir = tempdir().unwrap();
+        let base_dir = test_dir.path();
+        let dataset_dir = base_dir.join("non_existing");
+        let dataset_uri = dataset_dir.to_str().unwrap();
+
+        let res = Dataset::open(dataset_uri).await;
+        assert!(res.is_err());
+
+        assert!(!dataset_dir.exists());
     }
 }

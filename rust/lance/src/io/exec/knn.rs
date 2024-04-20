@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::any::Any;
 use std::pin::Pin;
@@ -482,18 +471,15 @@ impl ExecutionPlan for KNNIndexExec {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
-
     use arrow_array::RecordBatchIterator;
     use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use futures::TryStreamExt;
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
     use crate::arrow::*;
-    use crate::dataset::{Dataset, WriteParams};
+    use crate::dataset::WriteParams;
     use crate::io::exec::testing::TestingExec;
 
     #[tokio::test]
@@ -571,6 +557,7 @@ mod tests {
                 key: q,
                 k: 10,
                 nprobes: 0,
+                ef: None,
                 refine_factor: None,
                 metric_type: MetricType::L2,
                 use_index: false,
@@ -604,6 +591,7 @@ mod tests {
             key: Arc::new(generate_random_array(dim)),
             k: 10,
             nprobes: 0,
+            ef: None,
             refine_factor: None,
             metric_type: MetricType::L2,
             use_index: false,

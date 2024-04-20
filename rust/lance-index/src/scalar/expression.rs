@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{ops::Bound, sync::Arc};
 
@@ -500,18 +489,14 @@ pub fn apply_scalar_indices(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::ops::Bound;
 
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{Field, Schema};
     use datafusion::error::Result as DFResult;
     use datafusion_common::{config::ConfigOptions, TableReference};
-    use datafusion_common::{Column, DFSchema, ScalarValue};
-    use datafusion_expr::{AggregateUDF, Expr, ScalarUDF, TableSource, WindowUDF};
+    use datafusion_common::{Column, DFSchema};
+    use datafusion_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
     use datafusion_sql::planner::{ContextProvider, PlannerContext, SqlToRel};
     use datafusion_sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
-
-    use crate::scalar::expression::apply_scalar_indices;
-    use crate::scalar::ScalarQuery;
 
     use super::*;
 

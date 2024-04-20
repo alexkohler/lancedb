@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
     any::Any,
@@ -42,7 +31,7 @@ use futures::{
 use lance_core::{Error, Result};
 use lance_datafusion::{
     chunker::chunk_concat_stream,
-    exec::{execute_plan, OneShotExec},
+    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
 };
 use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
@@ -493,15 +482,15 @@ impl Ord for OrderableScalarValue {
             (DurationNanosecond(_), _) => {
                 panic!("Attempt to compare DurationNanosecond with non-DurationNanosecond")
             }
-            (Struct(_v1, _t1), Struct(_v2, _t2)) => todo!(),
-            (Struct(v1, _), Null) => {
-                if v1.is_none() {
+            (Struct(_arr), Struct(_arr2)) => todo!(),
+            (Struct(arr), Null) => {
+                if arr.is_empty() {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
             }
-            (Struct(_, _), _) => panic!("Attempt to compare Struct with non-Struct"),
+            (Struct(_arr), _) => panic!("Attempt to compare Struct with non-Struct"),
             (Dictionary(_k1, _v1), Dictionary(_k2, _v2)) => todo!(),
             (Dictionary(_, v1), Null) => Self(*v1.clone()).cmp(&Self(ScalarValue::Null)),
             (Dictionary(_, _), _) => panic!("Attempt to compare Dictionary with non-Dictionary"),
@@ -1124,7 +1113,13 @@ impl BtreeTrainingSource for BTreeUpdater {
         // them back into a single partition.
         let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
         let ordered = Arc::new(SortPreservingMergeExec::new(vec![sort_expr], all_data));
-        let unchunked = execute_plan(ordered)?;
+        let unchunked = execute_plan(
+            ordered,
+            LanceExecutionOptions {
+                use_spilling: true,
+                ..Default::default()
+            },
+        )?;
         Ok(chunk_concat_stream(unchunked, chunk_size as usize))
     }
 }

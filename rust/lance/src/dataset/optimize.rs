@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Table maintenance for optimizing table layout.
 //!
@@ -508,8 +497,15 @@ pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
-    // We assume here that get_fragments is returning the fragments in a
-    // meaningful order that we want to preserve.
+    // get_fragments should be returning fragments in sorted order (by id)
+    // and fragment ids should be unique
+    debug_assert!(
+        dataset
+            .get_fragments()
+            .windows(2)
+            .all(|w| w[0].id() < w[1].id()),
+        "fragments in manifest are not sorted"
+    );
     let mut fragment_metrics = futures::stream::iter(dataset.get_fragments())
         .map(|fragment| async move {
             match collect_metrics(&fragment).await {
@@ -813,6 +809,7 @@ async fn rewrite_files(
         ..Default::default()
     };
     let mut new_fragments = write_fragments_internal(
+        Some(dataset.as_ref()),
         dataset.object_store.clone(),
         &dataset.base,
         dataset.schema(),
@@ -931,7 +928,6 @@ mod tests {
     use arrow_array::{Float32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
-    use futures::TryStreamExt;
     use tempfile::tempdir;
 
     use super::*;
@@ -1368,12 +1364,7 @@ mod tests {
             .iter()
             .map(|f| f.id())
             .collect::<Vec<_>>();
-        // Fragment ids are assigned on task completion, but that isn't deterministic.
-        // But we can say the old fragment id=3 should be in the middle, and all
-        // the other ids should be greater than 6.
-        assert_eq!(fragment_ids[2], 3);
-        assert!(fragment_ids.iter().all(|id| *id > 6 || *id == 3));
-        dataset.validate().await.unwrap();
+        assert_eq!(fragment_ids, vec![3, 7, 8, 9, 10]);
     }
 
     #[tokio::test]

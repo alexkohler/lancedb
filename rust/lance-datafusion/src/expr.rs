@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Utilities for working with datafusion expressions
 
@@ -18,24 +7,31 @@ use std::sync::Arc;
 
 use arrow::compute::cast;
 use arrow_array::{cast::AsArray, ArrayRef};
-use arrow_schema::{DataType, Schema};
-use datafusion::{
-    datasource::empty::EmptyTable, execution::context::SessionContext, logical_expr::Expr,
-};
-use datafusion_common::{
-    tree_node::{Transformed, TreeNode},
-    Column, DataFusionError, ScalarValue, TableReference,
-};
-use prost::Message;
-use snafu::{location, Location};
+use arrow_schema::{DataType, TimeUnit};
+use datafusion_common::ScalarValue;
 
-use lance_core::{Error, Result};
-use substrait::proto::{
-    expression_reference::ExprType,
-    plan_rel::RelType,
-    read_rel::{NamedTable, ReadType},
-    rel, ExtendedExpression, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelRoot,
+#[cfg(feature = "substrait")]
+use {
+    arrow_schema::Schema,
+    datafusion::{
+        datasource::empty::EmptyTable, execution::context::SessionContext, logical_expr::Expr,
+    },
+    datafusion_common::{
+        tree_node::{Transformed, TreeNode},
+        Column, DataFusionError, TableReference,
+    },
+    datafusion_substrait::substrait::proto::{
+        expression_reference::ExprType,
+        plan_rel::RelType,
+        read_rel::{NamedTable, ReadType},
+        rel, ExtendedExpression, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelRoot,
+    },
+    lance_core::{Error, Result},
+    prost::Message,
+    snafu::{location, Location},
 };
+
+const MS_PER_DAY: i64 = 86400000;
 
 // This is slightly tedious but when we convert expressions from SQL strings to logical
 // datafusion expressions there is no type coercion that happens.  In other words "x = 7"
@@ -265,6 +261,122 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
                 _ => None,
             }
         }
+        ScalarValue::TimestampSecond(seconds, _) => match ty {
+            DataType::Timestamp(TimeUnit::Second, _) => Some(value.clone()),
+            DataType::Timestamp(TimeUnit::Millisecond, tz) => seconds
+                .and_then(|v| v.checked_mul(1000))
+                .map(|val| ScalarValue::TimestampMillisecond(Some(val), tz.clone())),
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => seconds
+                .and_then(|v| v.checked_mul(1000000))
+                .map(|val| ScalarValue::TimestampMicrosecond(Some(val), tz.clone())),
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => seconds
+                .and_then(|v| v.checked_mul(1000000000))
+                .map(|val| ScalarValue::TimestampNanosecond(Some(val), tz.clone())),
+            _ => None,
+        },
+        ScalarValue::TimestampMillisecond(millis, _) => match ty {
+            DataType::Timestamp(TimeUnit::Second, tz) => {
+                millis.map(|val| ScalarValue::TimestampSecond(Some(val / 1000), tz.clone()))
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => Some(value.clone()),
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => millis
+                .and_then(|v| v.checked_mul(1000))
+                .map(|val| ScalarValue::TimestampMicrosecond(Some(val), tz.clone())),
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => millis
+                .and_then(|v| v.checked_mul(1000000))
+                .map(|val| ScalarValue::TimestampNanosecond(Some(val), tz.clone())),
+            _ => None,
+        },
+        ScalarValue::TimestampMicrosecond(micros, _) => match ty {
+            DataType::Timestamp(TimeUnit::Second, tz) => {
+                micros.map(|val| ScalarValue::TimestampSecond(Some(val / 1000000), tz.clone()))
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+                micros.map(|val| ScalarValue::TimestampMillisecond(Some(val / 1000), tz.clone()))
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => Some(value.clone()),
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => micros
+                .and_then(|v| v.checked_mul(1000))
+                .map(|val| ScalarValue::TimestampNanosecond(Some(val), tz.clone())),
+            _ => None,
+        },
+        ScalarValue::TimestampNanosecond(nanos, _) => {
+            match ty {
+                DataType::Timestamp(TimeUnit::Second, tz) => nanos
+                    .map(|val| ScalarValue::TimestampSecond(Some(val / 1000000000), tz.clone())),
+                DataType::Timestamp(TimeUnit::Millisecond, tz) => nanos
+                    .map(|val| ScalarValue::TimestampMillisecond(Some(val / 1000000), tz.clone())),
+                DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+                    nanos.map(|val| ScalarValue::TimestampMicrosecond(Some(val / 1000), tz.clone()))
+                }
+                DataType::Timestamp(TimeUnit::Nanosecond, _) => Some(value.clone()),
+                _ => None,
+            }
+        }
+        ScalarValue::Date32(ticks) => match ty {
+            DataType::Date32 => Some(value.clone()),
+            DataType::Date64 => Some(ScalarValue::Date64(
+                ticks.map(|v| i64::from(v) * MS_PER_DAY),
+            )),
+            _ => None,
+        },
+        ScalarValue::Date64(ticks) => match ty {
+            DataType::Date32 => Some(ScalarValue::Date32(ticks.map(|v| (v / MS_PER_DAY) as i32))),
+            DataType::Date64 => Some(value.clone()),
+            _ => None,
+        },
+        ScalarValue::Time32Second(seconds) => {
+            match ty {
+                DataType::Time32(TimeUnit::Second) => Some(value.clone()),
+                DataType::Time32(TimeUnit::Millisecond) => {
+                    seconds.map(|val| ScalarValue::Time32Millisecond(Some(val * 1000)))
+                }
+                DataType::Time64(TimeUnit::Microsecond) => seconds
+                    .map(|val| ScalarValue::Time64Microsecond(Some(i64::from(val) * 1000000))),
+                DataType::Time64(TimeUnit::Nanosecond) => seconds
+                    .map(|val| ScalarValue::Time64Nanosecond(Some(i64::from(val) * 1000000000))),
+                _ => None,
+            }
+        }
+        ScalarValue::Time32Millisecond(millis) => match ty {
+            DataType::Time32(TimeUnit::Second) => {
+                millis.map(|val| ScalarValue::Time32Second(Some(val / 1000)))
+            }
+            DataType::Time32(TimeUnit::Millisecond) => Some(value.clone()),
+            DataType::Time64(TimeUnit::Microsecond) => {
+                millis.map(|val| ScalarValue::Time64Microsecond(Some(i64::from(val) * 1000)))
+            }
+            DataType::Time64(TimeUnit::Nanosecond) => {
+                millis.map(|val| ScalarValue::Time64Nanosecond(Some(i64::from(val) * 1000000)))
+            }
+            _ => None,
+        },
+        ScalarValue::Time64Microsecond(micros) => match ty {
+            DataType::Time32(TimeUnit::Second) => {
+                micros.map(|val| ScalarValue::Time32Second(Some((val / 1000000) as i32)))
+            }
+            DataType::Time32(TimeUnit::Millisecond) => {
+                micros.map(|val| ScalarValue::Time32Millisecond(Some((val / 1000) as i32)))
+            }
+            DataType::Time64(TimeUnit::Microsecond) => Some(value.clone()),
+            DataType::Time64(TimeUnit::Nanosecond) => {
+                micros.map(|val| ScalarValue::Time64Nanosecond(Some(val * 1000)))
+            }
+            _ => None,
+        },
+        ScalarValue::Time64Nanosecond(nanos) => match ty {
+            DataType::Time32(TimeUnit::Second) => {
+                nanos.map(|val| ScalarValue::Time32Second(Some((val / 1000000000) as i32)))
+            }
+            DataType::Time32(TimeUnit::Millisecond) => {
+                nanos.map(|val| ScalarValue::Time32Millisecond(Some((val / 1000000) as i32)))
+            }
+            DataType::Time64(TimeUnit::Microsecond) => {
+                nanos.map(|val| ScalarValue::Time64Microsecond(Some(val / 1000)))
+            }
+            DataType::Time64(TimeUnit::Nanosecond) => Some(value.clone()),
+            _ => None,
+        },
         ScalarValue::LargeList(values) => {
             let values = values.clone() as ArrayRef;
             let new_values = cast(&values, ty).ok()?;
@@ -304,6 +416,7 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
 /// Convert a Substrait ExtendedExpressions message into a DF Expr
 ///
 /// The ExtendedExpressions message must contain a single scalar expression
+#[cfg(feature = "substrait")]
 pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<Expr> {
     let envelope = ExtendedExpression::decode(expr)?;
     if envelope.referred_expr.is_empty() {
@@ -423,16 +536,293 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
 mod tests {
     use super::*;
 
-    use arrow_schema::Field;
-    use datafusion::logical_expr::{BinaryExpr, Operator};
-    use datafusion_common::Column;
-    use prost::Message;
-    use substrait_expr::{
-        builder::{schema::SchemaBuildersExt, BuilderParams, ExpressionsBuilder},
-        functions::functions_comparison::FunctionsComparisonExt,
-        helpers::{literals::literal, schema::SchemaInfo},
+    #[cfg(feature = "substrait")]
+    use {
+        arrow_schema::Field,
+        datafusion::logical_expr::{BinaryExpr, Operator},
+        substrait_expr::{
+            builder::{schema::SchemaBuildersExt, BuilderParams, ExpressionsBuilder},
+            functions::functions_comparison::FunctionsComparisonExt,
+            helpers::{literals::literal, schema::SchemaInfo},
+        },
     };
 
+    #[test]
+    fn test_temporal_coerce() {
+        // Conversion from timestamps in one resolution to timestamps in another resolution is allowed
+        // s->s
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampSecond(Some(5), None),
+                &DataType::Timestamp(TimeUnit::Second, None),
+            ),
+            Some(ScalarValue::TimestampSecond(Some(5), None))
+        );
+        // s->ms
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampSecond(Some(5), None),
+                &DataType::Timestamp(TimeUnit::Millisecond, None),
+            ),
+            Some(ScalarValue::TimestampMillisecond(Some(5000), None))
+        );
+        // s->us
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampSecond(Some(5), None),
+                &DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            Some(ScalarValue::TimestampMicrosecond(Some(5000000), None))
+        );
+        // s->ns
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampSecond(Some(5), None),
+                &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            Some(ScalarValue::TimestampNanosecond(Some(5000000000), None))
+        );
+        // ms->s
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampMillisecond(Some(5000), None),
+                &DataType::Timestamp(TimeUnit::Second, None),
+            ),
+            Some(ScalarValue::TimestampSecond(Some(5), None))
+        );
+        // ms->ms
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampMillisecond(Some(5000), None),
+                &DataType::Timestamp(TimeUnit::Millisecond, None),
+            ),
+            Some(ScalarValue::TimestampMillisecond(Some(5000), None))
+        );
+        // ms->us
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampMillisecond(Some(5000), None),
+                &DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            Some(ScalarValue::TimestampMicrosecond(Some(5000000), None))
+        );
+        // ms->ns
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampMillisecond(Some(5000), None),
+                &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            Some(ScalarValue::TimestampNanosecond(Some(5000000000), None))
+        );
+        // us->s
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampMicrosecond(Some(5000000), None),
+                &DataType::Timestamp(TimeUnit::Second, None),
+            ),
+            Some(ScalarValue::TimestampSecond(Some(5), None))
+        );
+        // us->ms
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampMicrosecond(Some(5000000), None),
+                &DataType::Timestamp(TimeUnit::Millisecond, None),
+            ),
+            Some(ScalarValue::TimestampMillisecond(Some(5000), None))
+        );
+        // us->us
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampMicrosecond(Some(5000000), None),
+                &DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            Some(ScalarValue::TimestampMicrosecond(Some(5000000), None))
+        );
+        // us->ns
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampMicrosecond(Some(5000000), None),
+                &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            Some(ScalarValue::TimestampNanosecond(Some(5000000000), None))
+        );
+        // ns->s
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampNanosecond(Some(5000000000), None),
+                &DataType::Timestamp(TimeUnit::Second, None),
+            ),
+            Some(ScalarValue::TimestampSecond(Some(5), None))
+        );
+        // ns->ms
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampNanosecond(Some(5000000000), None),
+                &DataType::Timestamp(TimeUnit::Millisecond, None),
+            ),
+            Some(ScalarValue::TimestampMillisecond(Some(5000), None))
+        );
+        // ns->us
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampNanosecond(Some(5000000000), None),
+                &DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            Some(ScalarValue::TimestampMicrosecond(Some(5000000), None))
+        );
+        // ns->ns
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampNanosecond(Some(5000000000), None),
+                &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            Some(ScalarValue::TimestampNanosecond(Some(5000000000), None))
+        );
+        // Precision loss on coercion is allowed (truncation)
+        // ns->s
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::TimestampNanosecond(Some(5987654321), None),
+                &DataType::Timestamp(TimeUnit::Second, None),
+            ),
+            Some(ScalarValue::TimestampSecond(Some(5), None))
+        );
+        // Conversions from date-32 to date-64 is allowed
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Date32(Some(5)), &DataType::Date32,),
+            Some(ScalarValue::Date32(Some(5)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Date32(Some(5)), &DataType::Date64,),
+            Some(ScalarValue::Date64(Some(5 * MS_PER_DAY)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Date64(Some(5 * MS_PER_DAY)),
+                &DataType::Date32,
+            ),
+            Some(ScalarValue::Date32(Some(5)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Date64(Some(5)), &DataType::Date64,),
+            Some(ScalarValue::Date64(Some(5)))
+        );
+        // Time-32 to time-64 (and within time-32 and time-64) is allowed
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time32Second(Some(5)),
+                &DataType::Time32(TimeUnit::Second),
+            ),
+            Some(ScalarValue::Time32Second(Some(5)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time32Second(Some(5)),
+                &DataType::Time32(TimeUnit::Millisecond),
+            ),
+            Some(ScalarValue::Time32Millisecond(Some(5000)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time32Second(Some(5)),
+                &DataType::Time64(TimeUnit::Microsecond),
+            ),
+            Some(ScalarValue::Time64Microsecond(Some(5000000)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time32Second(Some(5)),
+                &DataType::Time64(TimeUnit::Nanosecond),
+            ),
+            Some(ScalarValue::Time64Nanosecond(Some(5000000000)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time32Millisecond(Some(5000)),
+                &DataType::Time32(TimeUnit::Second),
+            ),
+            Some(ScalarValue::Time32Second(Some(5)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time32Millisecond(Some(5000)),
+                &DataType::Time32(TimeUnit::Millisecond),
+            ),
+            Some(ScalarValue::Time32Millisecond(Some(5000)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time32Millisecond(Some(5000)),
+                &DataType::Time64(TimeUnit::Microsecond),
+            ),
+            Some(ScalarValue::Time64Microsecond(Some(5000000)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time32Millisecond(Some(5000)),
+                &DataType::Time64(TimeUnit::Nanosecond),
+            ),
+            Some(ScalarValue::Time64Nanosecond(Some(5000000000)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time64Microsecond(Some(5000000)),
+                &DataType::Time32(TimeUnit::Second),
+            ),
+            Some(ScalarValue::Time32Second(Some(5)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time64Microsecond(Some(5000000)),
+                &DataType::Time32(TimeUnit::Millisecond),
+            ),
+            Some(ScalarValue::Time32Millisecond(Some(5000)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time64Microsecond(Some(5000000)),
+                &DataType::Time64(TimeUnit::Microsecond),
+            ),
+            Some(ScalarValue::Time64Microsecond(Some(5000000)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time64Microsecond(Some(5000000)),
+                &DataType::Time64(TimeUnit::Nanosecond),
+            ),
+            Some(ScalarValue::Time64Nanosecond(Some(5000000000)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time64Nanosecond(Some(5000000000)),
+                &DataType::Time32(TimeUnit::Second),
+            ),
+            Some(ScalarValue::Time32Second(Some(5)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time64Nanosecond(Some(5000000000)),
+                &DataType::Time32(TimeUnit::Millisecond),
+            ),
+            Some(ScalarValue::Time32Millisecond(Some(5000)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time64Nanosecond(Some(5000000000)),
+                &DataType::Time64(TimeUnit::Microsecond),
+            ),
+            Some(ScalarValue::Time64Microsecond(Some(5000000)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Time64Nanosecond(Some(5000000000)),
+                &DataType::Time64(TimeUnit::Nanosecond),
+            ),
+            Some(ScalarValue::Time64Nanosecond(Some(5000000000)))
+        );
+    }
+
+    #[cfg(feature = "substrait")]
     #[tokio::test]
     async fn test_substrait_conversion() {
         let schema = SchemaInfo::new_full()

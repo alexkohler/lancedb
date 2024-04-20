@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -19,7 +8,7 @@ use async_trait::async_trait;
 use chrono::prelude::*;
 use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
 use lance_file::reader::FileReader;
-use lance_io::traits::ProtoStruct;
+use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost_types::Timestamp;
 
@@ -143,7 +132,9 @@ impl Manifest {
         let nanos = self.timestamp_nanos % 1_000_000_000;
         let seconds = ((self.timestamp_nanos - nanos) / 1_000_000_000) as i64;
         Utc.from_utc_datetime(
-            &NaiveDateTime::from_timestamp_opt(seconds, nanos as u32).unwrap_or(NaiveDateTime::MIN),
+            &DateTime::from_timestamp(seconds, nanos as u32)
+                .unwrap_or_default()
+                .naive_utc(),
         )
     }
 
@@ -180,6 +171,22 @@ impl Manifest {
         } else {
             Some(self.max_fragment_id.into())
         }
+    }
+
+    /// Get the max used field id
+    ///
+    /// This is different than [Schema::max_field_id] because it also considers
+    /// the field ids in the data files that have been dropped from the schema.
+    pub fn max_field_id(&self) -> i32 {
+        let schema_max_id = self.schema.max_field_id().unwrap_or(-1);
+        let fragment_max_id = self
+            .fragments
+            .iter()
+            .flat_map(|f| f.files.iter().flat_map(|file| file.fields.as_slice()))
+            .max()
+            .copied();
+        let fragment_max_id = fragment_max_id.unwrap_or(-1);
+        schema_max_id.max(fragment_max_id)
     }
 
     /// Return the fragments that are newer than the given manifest.
@@ -415,39 +422,60 @@ pub trait SelfDescribingFileReader {
         cache: Option<&FileMetadataCache>,
     ) -> Result<Self>
     where
+        Self: Sized,
+    {
+        let reader = object_store.open(path).await?;
+        Self::try_new_self_described_from_reader(reader.into(), cache).await
+    }
+
+    async fn try_new_self_described_from_reader(
+        reader: Arc<dyn Reader>,
+        cache: Option<&FileMetadataCache>,
+    ) -> Result<Self>
+    where
         Self: Sized;
 }
 
 #[async_trait]
 impl SelfDescribingFileReader for FileReader {
-    async fn try_new_self_described(
-        object_store: &ObjectStore,
-        path: &Path,
+    async fn try_new_self_described_from_reader(
+        reader: Arc<dyn Reader>,
         cache: Option<&FileMetadataCache>,
     ) -> Result<Self> {
-        let object_reader = object_store.open(path).await?;
-        let metadata = Self::read_metadata(object_reader.as_ref(), cache).await?;
+        let metadata = Self::read_metadata(reader.as_ref(), cache).await?;
         let manifest_position = metadata.manifest_position.ok_or(Error::Internal {
             message: format!(
                 "Attempt to open file at {} as self-describing but it did not contain a manifest",
-                path
+                reader.path(),
             ),
             location: location!(),
         })?;
-        let mut manifest: Manifest = read_struct(object_reader.as_ref(), manifest_position).await?;
-        populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
+        let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
+        populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         let schema = manifest.schema;
-        Self::try_new_from_reader(path, object_reader, metadata, schema, 0, 0, cache).await
+        let max_field_id = schema.max_field_id().unwrap_or_default();
+        Self::try_new_from_reader(
+            reader.path(),
+            reader.clone(),
+            Some(metadata),
+            schema,
+            0,
+            0,
+            max_field_id,
+            cache,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::format::DataFile;
+
     use super::*;
 
-    use super::Fragment;
-    use arrow_schema::{Field, Schema as ArrowSchema};
-    use lance_core::datatypes::Schema;
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::datatypes::Field;
 
     #[test]
     fn test_writer_version() {
@@ -477,13 +505,16 @@ mod tests {
 
     #[test]
     fn test_fragments_by_offset_range() {
-        let arrow_schema =
-            ArrowSchema::new(vec![Field::new("a", arrow_schema::DataType::Int64, false)]);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let fragments = vec![
-            Fragment::with_file(0, "path1", &schema, Some(10)),
-            Fragment::with_file(1, "path2", &schema, Some(15)),
-            Fragment::with_file(2, "path3", &schema, Some(20)),
+            Fragment::with_file_legacy(0, "path1", &schema, Some(10)),
+            Fragment::with_file_legacy(1, "path2", &schema, Some(15)),
+            Fragment::with_file_legacy(2, "path3", &schema, Some(20)),
         ];
         let manifest = Manifest::new(schema, Arc::new(fragments));
 
@@ -511,5 +542,42 @@ mod tests {
         assert!(actual.is_empty());
 
         assert!(manifest.fragments_by_offset_range(200..400).is_empty());
+    }
+
+    #[test]
+    fn test_max_field_id() {
+        // Validate that max field id handles varying field ids by fragment.
+        let mut field0 =
+            Field::try_from(ArrowField::new("a", arrow_schema::DataType::Int64, false)).unwrap();
+        field0.set_id(-1, &mut 0);
+        let mut field2 =
+            Field::try_from(ArrowField::new("b", arrow_schema::DataType::Int64, false)).unwrap();
+        field2.set_id(-1, &mut 2);
+
+        let schema = Schema {
+            fields: vec![field0, field2],
+            metadata: Default::default(),
+        };
+        let fragments = vec![
+            Fragment {
+                id: 0,
+                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 2])],
+                deletion_file: None,
+                physical_rows: None,
+            },
+            Fragment {
+                id: 1,
+                files: vec![
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 43]),
+                    DataFile::new_legacy_from_fields("path3", vec![2]),
+                ],
+                deletion_file: None,
+                physical_rows: None,
+            },
+        ];
+
+        let manifest = Manifest::new(schema, Arc::new(fragments));
+
+        assert_eq!(manifest.max_field_id(), 43);
     }
 }

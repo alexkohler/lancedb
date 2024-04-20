@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Secondary Index pre-filter
 //!
@@ -42,6 +31,8 @@ use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
 
 /// A trait to be implemented by anything supplying a prefilter row id mask
+///
+/// This trait is for internal use only and has no stability guarantees.
 #[async_trait]
 pub trait FilterLoader: Send + 'static {
     async fn load(self: Box<Self>) -> Result<RowIdMask>;
@@ -51,6 +42,8 @@ pub trait FilterLoader: Send + 'static {
 ///
 /// This could be both rows that are deleted or a prefilter
 /// that should be applied to the search
+///
+/// This struct is for internal use only and has no stability guarantees.
 pub struct PreFilter {
     // Expressing these as tasks allows us to start calculating the block list
     // and allow list at the same time we start searching the query.  We will await

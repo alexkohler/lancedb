@@ -1,17 +1,5 @@
-#  Copyright (c) 2023. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-#
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 from __future__ import annotations
 
@@ -64,6 +52,7 @@ from .lance import (
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .optimize import Compaction
+from .schema import LanceSchema
 from .util import td_to_micros
 
 if TYPE_CHECKING:
@@ -167,11 +156,18 @@ class LanceDataset(pa.dataset.Dataset):
         index_cache_size: Optional[int] = None,
         metadata_cache_size: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
+        storage_options: Optional[Dict[str, str]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._ds = _Dataset(
-            uri, version, block_size, index_cache_size, metadata_cache_size, commit_lock
+            uri,
+            version,
+            block_size,
+            index_cache_size,
+            metadata_cache_size,
+            commit_lock,
+            storage_options,
         )
 
     def __reduce__(self):
@@ -183,6 +179,12 @@ class LanceDataset(pa.dataset.Dataset):
     def __setstate__(self, state):
         self._uri, version = state
         self._ds = _Dataset(self._uri, version)
+
+    def __copy__(self):
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._uri = self._uri
+        ds._ds = copy.copy(self._ds)
+        return ds
 
     def __len__(self):
         return self.count_rows()
@@ -326,6 +328,13 @@ class LanceDataset(pa.dataset.Dataset):
         The pyarrow Schema for this dataset
         """
         return self._ds.schema
+
+    @property
+    def lance_schema(self) -> "LanceSchema":
+        """
+        The LanceSchema for this dataset
+        """
+        return self._ds.lance_schema
 
     def to_table(
         self,
@@ -604,10 +613,11 @@ class LanceDataset(pa.dataset.Dataset):
             The total number of rows in the dataset.
 
         """
-        if filter is None:
-            return self._ds.count_rows()
-        else:
+        if isinstance(filter, pa.compute.Expression):
+            # TODO: consolidate all to use scanner
             return self.scanner(filter=filter).count_rows()
+
+        return self._ds.count_rows(filter)
 
     def join(
         self,
@@ -628,8 +638,10 @@ class LanceDataset(pa.dataset.Dataset):
     def alter_columns(self, *alterations: Iterable[Dict[str, Any]]):
         """Alter column name, data type, and nullability.
 
-        Columns that are renamed can keep any indices that are on them. However, if
-        the column is cast to a different type, its indices will be dropped.
+        Columns that are renamed can keep any indices that are on them. If a
+        column has an IVF_PQ index, it can be kept if the column is casted to
+        another type. However, other index types don't support casting at this
+        time.
 
         Column types can be upcasted (such as int32 to int64) or downcasted
         (such as int64 to int32). However, downcasting will fail if there are
@@ -1177,17 +1189,26 @@ class LanceDataset(pa.dataset.Dataset):
             and not pa.types.is_floating(field.type)
             and not pa.types.is_boolean(field.type)
             and not pa.types.is_string(field.type)
+            and not pa.types.is_temporal(field.type)
         ):
             raise TypeError(
-                f"Scalar index column {column} must be int, float, bool, or str"
+                f"Scalar index column {column} must be int",
+                ", float, bool, str, or temporal",
+            )
+
+        if pa.types.is_duration(field.type):
+            raise TypeError(
+                f"Scalar index column {column} cannot currently be a duration"
             )
 
         index_type = index_type.upper()
         if index_type != "BTREE":
-            raise NotImplementedError((
-                'Only "BTREE" is supported for ',
-                f"index_type.  Received {index_type}",
-            ))
+            raise NotImplementedError(
+                (
+                    'Only "BTREE" is supported for ',
+                    f"index_type.  Received {index_type}",
+                )
+            )
 
         self._ds.create_index([column], index_type, name, replace)
 
@@ -1275,11 +1296,11 @@ class LanceDataset(pa.dataset.Dataset):
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
         - **ivf_centroids**: K-mean centroids for IVF clustering.
 
-        If ``index_type`` is "DISKANN", then the following parameters are optional:
-
-        - **r**: out-degree bound
-        - **l**: number of levels in the graph.
-        - **alpha**: distance threshold for the graph.
+        Optional parameters for "IVF_HNSW_*":
+        - **max_level**: the maximum number of levels in the graph.
+        - **m**: the number of edges per node in the graph.
+        - **m_max**: the maximum number of edges per node in the graph.
+        - **ef_construction**: the number of nodes to examine during the construction.
 
         Examples
         --------
@@ -1362,12 +1383,13 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
-        if index_type not in ["IVF_PQ", "DISKANN"]:
+        valid_index_types = ["IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
+        if index_type not in valid_index_types:
             raise NotImplementedError(
-                f"Only IVF_PQ or DiskANN index_types supported. Got {index_type}"
+                f"Only {valid_index_types} index types supported. " f"Got {index_type}"
             )
-        if index_type == "IVF_PQ":
-            if num_partitions is None or num_sub_vectors is None:
+        if index_type.startswith("IVF"):
+            if num_partitions is None:
                 raise ValueError(
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
                 )
@@ -1379,7 +1401,6 @@ class LanceDataset(pa.dataset.Dataset):
                     f"num_partitions must be int, got {type(num_partitions)}"
                 )
             kwargs["num_partitions"] = num_partitions
-            kwargs["num_sub_vectors"] = num_sub_vectors
 
             if accelerator is not None and ivf_centroids is None:
                 # Use accelerator to train ivf centroids
@@ -1425,6 +1446,13 @@ class LanceDataset(pa.dataset.Dataset):
                     [ivf_centroids], ["_ivf_centroids"]
                 )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
+
+        if "PQ" in index_type:
+            if num_sub_vectors is None:
+                raise ValueError(
+                    "num_partitions and num_sub_vectors are required for IVF_PQ"
+                )
+            kwargs["num_sub_vectors"] = num_sub_vectors
 
             if pq_codebook is not None:
                 # User provided IVF centroids
@@ -1794,8 +1822,9 @@ class LanceOperation:
         ----------
         fragments: iterable of FragmentMetadata
             The fragments that make up the new dataset.
-        schema: pyarrow.Schema
-            The schema of the new dataset.
+        schema: LanceSchema or pyarrow.Schema
+            The schema of the new dataset. Passing a LanceSchema is preferred,
+            and passing a pyarrow.Schema is deprecated.
 
         Warning
         -------
@@ -1825,9 +1854,9 @@ class LanceOperation:
         ...     return pa.record_batch([doubled], ["a_doubled"])
         >>> fragments = []
         >>> for fragment in dataset.get_fragments():
-        ...     new_fragment = fragment.add_columns(double_a, columns=['a'])
+        ...     new_fragment, new_schema = fragment.merge_columns(double_a,
+        ...                                                       columns=['a'])
         ...     fragments.append(new_fragment)
-        >>> new_schema = table.schema.append(pa.field("a_doubled", pa.int64()))
         >>> operation = lance.LanceOperation.Merge(fragments, new_schema)
         >>> dataset = lance.LanceDataset.commit("example", operation,
         ...                                     read_version=dataset.version)
@@ -1840,13 +1869,20 @@ class LanceOperation:
         """
 
         fragments: Iterable[FragmentMetadata]
-        schema: pa.Schema
+        schema: LanceSchema | pa.Schema
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.fragments)
 
         def _to_inner(self):
             raw_fragments = [f._metadata for f in self.fragments]
+            if isinstance(self.schema, pa.Schema):
+                warnings.warn(
+                    "Passing a pyarrow.Schema to Merge is deprecated. "
+                    "Please use a LanceSchema instead.",
+                    DeprecationWarning,
+                )
+                self.schema = LanceSchema.from_pyarrow(self.schema)
             return _Operation.merge(raw_fragments, self.schema)
 
     @dataclass
@@ -2314,6 +2350,8 @@ def write_dataset(
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
+    storage_options: Optional[Dict[str, str]] = None,
+    use_experimental_writer: bool = False,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -2350,6 +2388,12 @@ def write_dataset(
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
         starting to write and finishing writing.
+    storage_options : optional, dict
+        Extra options that make sense for a particular storage connection. This is
+        used to store connection parameters like credentials, endpoint, etc.
+    use_experimental_writer : optional, bool
+        Use the Lance v2 writer to write Lance v2 files.  This is not recommended
+        at this time as there are several known limitations in the v2 writer.
     """
     if _check_for_hugging_face(data_obj):
         # Huggingface datasets
@@ -2370,6 +2414,8 @@ def write_dataset(
         "max_rows_per_group": max_rows_per_group,
         "max_bytes_per_file": max_bytes_per_file,
         "progress": progress,
+        "storage_options": storage_options,
+        "use_experimental_writer": use_experimental_writer,
     }
 
     if commit_lock:
@@ -2378,8 +2424,12 @@ def write_dataset(
         params["commit_handler"] = commit_lock
 
     uri = os.fspath(uri) if isinstance(uri, Path) else uri
-    _write_dataset(reader, uri, params)
-    return LanceDataset(uri)
+    inner_ds = _write_dataset(reader, uri, params)
+
+    ds = LanceDataset.__new__(LanceDataset)
+    ds._ds = inner_ds
+    ds._uri = uri
+    return ds
 
 
 def _coerce_reader(

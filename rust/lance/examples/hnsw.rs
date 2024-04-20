@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Run recall benchmarks for HNSW.
 //!
@@ -25,7 +14,10 @@ use arrow_select::concat::concat;
 use clap::Parser;
 use futures::StreamExt;
 use lance::Dataset;
-use lance_index::vector::{graph::memory::InMemoryVectorStorage, hnsw::HNSWBuilder};
+use lance_index::vector::{
+    graph::memory::InMemoryVectorStorage,
+    hnsw::{builder::HnswBuildParams, HNSWBuilder},
+};
 use lance_linalg::{distance::MetricType, MatrixView};
 
 #[derive(Parser, Debug)]
@@ -92,20 +84,24 @@ async fn main() {
 
     for ef_construction in [15, 30, 50] {
         let now = std::time::Instant::now();
-        let hnsw = HNSWBuilder::new(vector_store.clone())
-            .max_level(args.max_level)
-            .num_edges(15)
-            .max_num_edges(args.max_edges)
-            .ef_construction(ef_construction)
-            .build()
-            .unwrap();
+        let hnsw = HNSWBuilder::with_params(
+            HnswBuildParams::default()
+                .max_level(args.max_level)
+                .num_edges(15)
+                .max_num_edges(args.max_edges)
+                .ef_construction(ef_construction),
+            vector_store.clone(),
+        )
+        .build()
+        .await
+        .unwrap();
         let construct_time = now.elapsed().as_secs_f32();
         let now = std::time::Instant::now();
         let results: HashSet<u32> = hnsw
-            .search(q, k, args.ef)
+            .search(q, k, args.ef, None)
             .unwrap()
             .iter()
-            .map(|(i, _)| *i)
+            .map(|node| node.id)
             .collect();
         let search_time = now.elapsed().as_micros();
         println!(

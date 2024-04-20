@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Lance Schema Field
 
@@ -348,7 +337,7 @@ impl Field {
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
-            f.children = self.children.clone()
+            f.children.clone_from(&self.children)
         } else {
             let first = path_components[0];
             for c in self.children.as_slice() {
@@ -763,7 +752,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{DictionaryArray, StringArray, UInt32Array};
-    use arrow_schema::{DataType, Fields, TimeUnit};
+    use arrow_schema::{Fields, TimeUnit};
 
     #[test]
     fn arrow_field_to_field() {

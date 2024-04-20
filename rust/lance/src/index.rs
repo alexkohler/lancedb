@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Secondary Index
 //!
@@ -22,6 +11,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_file::reader::FileReader;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
@@ -30,9 +20,11 @@ use lance_index::scalar::ScalarIndex;
 pub use lance_index::IndexParams;
 use lance_index::{pb, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
 use lance_io::traits::Reader;
-use lance_io::utils::{read_message, read_message_from_buf, read_metadata_offset};
-use lance_table::format::Fragment;
+use lance_io::utils::{
+    read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
+};
 use lance_table::format::Index as IndexMetadata;
+use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use serde_json::json;
@@ -45,6 +37,8 @@ pub(crate) mod cache;
 pub(crate) mod prefilter;
 pub mod scalar;
 pub mod vector;
+
+pub use crate::index::prefilter::{FilterLoader, PreFilter};
 
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::vector::remap_vector_index;
@@ -134,17 +128,9 @@ impl IndexInformationProvider for ScalarIndexInfo {
     }
 }
 
-async fn open_index_proto(dataset: &Dataset, reader: &dyn Reader) -> Result<pb::Index> {
-    let object_store = dataset.object_store();
-
+async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
     let file_size = reader.size().await?;
-    let block_size = object_store.block_size();
-    let begin = if file_size < block_size {
-        0
-    } else {
-        file_size - block_size
-    };
-    let tail_bytes = reader.get_range(begin..file_size).await?;
+    let tail_bytes = read_last_block(reader).await?;
     let metadata_pos = read_metadata_offset(&tail_bytes)?;
     let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
         // We have not read the metadata bytes yet.
@@ -405,7 +391,7 @@ impl DatasetIndexExt for Dataset {
         }
         let num_unindexed_fragments = unindexed_fragments.len();
         let num_indexed_fragments = self.fragments().len() - num_unindexed_fragments;
-        let num_indexed_rows = self.count_rows().await? - num_unindexed_rows;
+        let num_indexed_rows = self.count_rows(None).await? - num_unindexed_rows;
 
         let stats = json!({
             "index_type": indices_stats[0]["index_type"],
@@ -429,7 +415,7 @@ impl DatasetIndexExt for Dataset {
 ///
 /// Internal use only. No API stability guarantees.
 #[async_trait]
-pub(crate) trait DatasetIndexInternalExt: DatasetIndexExt {
+pub trait DatasetIndexInternalExt: DatasetIndexExt {
     /// Opens an index (scalar or vector) as a generic index
     async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>>;
     /// Opens the requested scalar index
@@ -485,6 +471,7 @@ impl DatasetIndexInternalExt for Dataset {
 
     async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>> {
         if let Some(index) = self.session.index_cache.get_vector(uuid) {
+            log::debug!("Found vector index in cache uuid: {}", uuid);
             return Ok(index);
         }
 
@@ -492,15 +479,51 @@ impl DatasetIndexInternalExt for Dataset {
         let index_file = index_dir.child(INDEX_FILE_NAME);
         let reader: Arc<dyn Reader> = self.object_store.open(&index_file).await?.into();
 
-        let proto = open_index_proto(self, reader.as_ref()).await?;
-        match &proto.implementation {
-            Some(Implementation::VectorIndex(vector_index)) => {
-                let dataset = Arc::new(self.clone());
-                crate::index::vector::open_vector_index(dataset, column, uuid, vector_index, reader)
-                    .await
+        let tailing_bytes = read_last_block(reader.as_ref()).await?;
+        let (major_version, minor_version) = read_version(&tailing_bytes)?;
+
+        // the index file is in lance format since version (0,2)
+        // TODO: we need to change the legacy IVF_PQ to be in lance format
+        match (major_version, minor_version) {
+            (0, 1) | (0, 0) => {
+                let proto = open_index_proto(reader.as_ref()).await?;
+                match &proto.implementation {
+                    Some(Implementation::VectorIndex(vector_index)) => {
+                        let dataset = Arc::new(self.clone());
+                        crate::index::vector::open_vector_index(
+                            dataset,
+                            column,
+                            uuid,
+                            vector_index,
+                            reader,
+                        )
+                        .await
+                    }
+                    None => Err(Error::Internal {
+                        message: "Index proto was missing implementation field".into(),
+                        location: location!(),
+                    }),
+                }
             }
-            None => Err(Error::Internal {
-                message: "Index proto was missing implementation field".into(),
+
+            (0, 2) => {
+                let reader = FileReader::try_new_self_described_from_reader(
+                    reader.clone(),
+                    Some(&self.session.file_metadata_cache),
+                )
+                .await?;
+                crate::index::vector::open_vector_index_v2(
+                    Arc::new(self.clone()),
+                    column,
+                    uuid,
+                    reader,
+                )
+                .await
+            }
+
+            _ => Err(Error::Index {
+                message: "unsupported index version (maybe need to upgrade your lance version)"
+                    .to_owned(),
                 location: location!(),
             }),
         }
@@ -548,7 +571,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{Field, Schema};
     use lance_arrow::*;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;

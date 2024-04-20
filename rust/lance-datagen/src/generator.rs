@@ -1,16 +1,24 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use std::{iter, marker::PhantomData, sync::Arc};
 
 use arrow::{
-    array::ArrayData,
-    buffer::{BooleanBuffer, Buffer, OffsetBuffer},
+    array::{ArrayData, AsArray},
+    buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer},
+    datatypes::{ArrowPrimitiveType, Int32Type},
 };
 use arrow_array::{
     make_array,
     types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
-    Array, FixedSizeListArray, RecordBatch, RecordBatchReader,
+    Array, FixedSizeBinaryArray, FixedSizeListArray, ListArray, PrimitiveArray, RecordBatch,
+    RecordBatchOptions, RecordBatchReader, StringArray, StructArray,
 };
-use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use rand::{Rng, RngCore, SeedableRng};
+use arrow_schema::{ArrowError, DataType, Field, Fields, Schema, SchemaRef};
+use futures::{stream::BoxStream, StreamExt};
+use rand::{distributions::Uniform, Rng, RngCore, SeedableRng};
+
+use self::array::rand_with_distribution;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct RowCount(u64);
@@ -166,7 +174,7 @@ impl ArrayGenerator for NullGenerator {
             let mut null_count = 0;
             // Sampling the RNG once per bit is kind of slow so we do this to sample once
             // per byte.  We only get 8 bits of RNG resolution but that should be good enough.
-            let threshold = (self.null_probability * std::u8::MAX as f64) as u8;
+            let threshold = (self.null_probability * u8::MAX as f64) as u8;
             let bytes = (0..num_validity_bytes)
                 .map(|byte_idx| {
                     let mut sample = rng.gen::<u64>();
@@ -423,6 +431,60 @@ impl ArrayGenerator for CycleVectorGenerator {
 }
 
 #[derive(Default)]
+pub struct PseduoUuidGenerator {}
+
+impl ArrayGenerator for PseduoUuidGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        Ok(Arc::new(FixedSizeBinaryArray::try_from_iter(
+            (0..length.0).map(|_| {
+                let mut data = vec![0; 16];
+                rng.fill_bytes(&mut data);
+                data
+            }),
+        )?))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &DataType::FixedSizeBinary(16)
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        Some(ByteCount::from(16))
+    }
+}
+
+#[derive(Default)]
+pub struct PseduoUuidHexGenerator {}
+
+impl ArrayGenerator for PseduoUuidHexGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let mut data = vec![0; 16 * length.0 as usize];
+        rng.fill_bytes(&mut data);
+        let data_hex = hex::encode(data);
+
+        Ok(Arc::new(StringArray::from_iter_values(
+            (0..length.0 as usize).map(|i| data_hex.get(i * 32..(i + 1) * 32).unwrap()),
+        )))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &DataType::Utf8
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        Some(ByteCount::from(16))
+    }
+}
+
+#[derive(Default)]
 pub struct RandomBooleanGenerator {}
 
 impl ArrayGenerator for RandomBooleanGenerator {
@@ -446,6 +508,50 @@ impl ArrayGenerator for RandomBooleanGenerator {
         // We can't say 1/8th of a byte and 1 byte would be a pretty extreme over-count so let's leave
         // it at None until someone needs this.  Then we can probably special case this (e.g. make a ByteCount::ONE_BIT)
         None
+    }
+}
+
+// Instead of using the "standard distribution" and generating values there are some cases (e.g. f16 / decimal)
+// where we just generate random bytes because there is no rand support
+pub struct RandomBytesGenerator<T: ArrowPrimitiveType + Send + Sync> {
+    phantom: PhantomData<T>,
+    data_type: DataType,
+}
+
+impl<T: ArrowPrimitiveType + Send + Sync> RandomBytesGenerator<T> {
+    fn new(data_type: DataType) -> Self {
+        Self {
+            phantom: Default::default(),
+            data_type,
+        }
+    }
+
+    fn byte_width() -> Result<u64, ArrowError> {
+        T::DATA_TYPE.primitive_width().ok_or_else(|| ArrowError::InvalidArgumentError(format!("Cannot generate the data type {} with the RandomBytesGenerator because it is not a fixed-width bytes type", T::DATA_TYPE))).map(|val| val as u64)
+    }
+}
+
+impl<T: ArrowPrimitiveType + Send + Sync> ArrayGenerator for RandomBytesGenerator<T> {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let num_bytes = length.0 * Self::byte_width()?;
+        let mut bytes = vec![0; num_bytes as usize];
+        rng.fill_bytes(&mut bytes);
+        let bytes = ScalarBuffer::new(Buffer::from(bytes), 0, length.0 as usize);
+        Ok(Arc::new(
+            PrimitiveArray::<T>::new(bytes, None).with_data_type(self.data_type.clone()),
+        ))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        Self::byte_width().map(ByteCount::from).ok()
     }
 }
 
@@ -686,6 +792,102 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> ArrayGenerator for DictionaryGener
     }
 }
 
+struct RandomListGenerator {
+    field: Arc<Field>,
+    child_field: Arc<Field>,
+    items_gen: Box<dyn ArrayGenerator>,
+    lengths_gen: Box<dyn ArrayGenerator>,
+}
+
+impl RandomListGenerator {
+    // Creates a list generator that generates random lists with lengths between 0 and 10 (inclusive)
+    fn new(items_gen: Box<dyn ArrayGenerator>) -> Self {
+        let child_field = Arc::new(Field::new("item", items_gen.data_type().clone(), true));
+        let field = Field::new("", DataType::List(child_field.clone()), true);
+        let lengths_dist = Uniform::new_inclusive(0, 10);
+        let lengths_gen = rand_with_distribution::<Int32Type, Uniform<i32>>(lengths_dist);
+        Self {
+            field: Arc::new(field),
+            child_field,
+            items_gen,
+            lengths_gen,
+        }
+    }
+}
+
+impl ArrayGenerator for RandomListGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn Array>, ArrowError> {
+        let lengths = self.lengths_gen.generate(length, rng)?;
+        let lengths = lengths.as_primitive::<Int32Type>();
+        let total_length = lengths.values().iter().sum::<i32>() as u64;
+        let offsets = OffsetBuffer::from_lengths(lengths.values().iter().map(|v| *v as usize));
+        let items = self.items_gen.generate(RowCount::from(total_length), rng)?;
+        Ok(Arc::new(ListArray::try_new(
+            self.child_field.clone(),
+            offsets,
+            items,
+            None,
+        )?))
+    }
+
+    fn data_type(&self) -> &DataType {
+        self.field.data_type()
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        None
+    }
+}
+
+struct RandomStructGenerator {
+    fields: Fields,
+    data_type: DataType,
+    child_gens: Vec<Box<dyn ArrayGenerator>>,
+}
+
+impl RandomStructGenerator {
+    fn new(fields: Fields, child_gens: Vec<Box<dyn ArrayGenerator>>) -> Self {
+        let data_type = DataType::Struct(fields.clone());
+        Self {
+            fields,
+            data_type,
+            child_gens,
+        }
+    }
+}
+
+impl ArrayGenerator for RandomStructGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let child_arrays = self
+            .child_gens
+            .iter_mut()
+            .map(|gen| gen.generate(length, rng))
+            .collect::<Result<Vec<_>, ArrowError>>()?;
+        let struct_arr = StructArray::new(self.fields.clone(), child_arrays, None);
+        Ok(Arc::new(struct_arr))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        let mut sum = 0;
+        for child_gen in &self.child_gens {
+            sum += child_gen.element_size_bytes()?.0;
+        }
+        Some(ByteCount::from(sum))
+    }
+}
+
 /// A RecordBatchReader that generates batches of the given size from the given array generators
 pub struct FixedSizeBatchGenerator {
     rng: rand_xoshiro::Xoshiro256PlusPlus,
@@ -739,7 +941,12 @@ impl FixedSizeBatchGenerator {
             arrays.push(arr);
         }
         self.num_batches.0 -= 1;
-        Ok(RecordBatch::try_new(self.schema.clone(), arrays).unwrap())
+        Ok(RecordBatch::try_new_with_options(
+            self.schema.clone(),
+            arrays,
+            &RecordBatchOptions::new().with_row_count(Some(self.batch_size.0 as usize)),
+        )
+        .unwrap())
     }
 }
 
@@ -832,6 +1039,18 @@ impl BatchGeneratorBuilder {
         )
     }
 
+    pub fn into_reader_stream(
+        self,
+        batch_size: RowCount,
+        num_batches: BatchCount,
+    ) -> BoxStream<'static, Result<RecordBatch, ArrowError>> {
+        // TODO: this is pretty lazy and could be optimized
+        let batches = self
+            .into_reader_rows(batch_size, num_batches)
+            .collect::<Vec<_>>();
+        futures::stream::iter(batches).boxed()
+    }
+
     /// Create a RecordBatchReader that generates batches of the given size (in bytes)
     pub fn into_reader_bytes(
         self,
@@ -865,8 +1084,9 @@ impl BatchGeneratorBuilder {
     }
 
     /// Set the seed for the generator
-    pub fn with_seed(&mut self, seed: Seed) {
+    pub fn with_seed(mut self, seed: Seed) -> Self {
         self.seed = Some(seed);
+        self
     }
 
     /// Adds nulls (with the given probability) to all columns
@@ -878,13 +1098,22 @@ impl BatchGeneratorBuilder {
 const MS_PER_DAY: i64 = 86400000;
 
 pub mod array {
-    use arrow_array::types::{
-        ArrowPrimitiveType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+
+    use arrow::datatypes::{
+        Int16Type, Int64Type, Int8Type, IntervalDayTimeType, IntervalMonthDayNanoType,
     };
-    use arrow_array::{ArrowNativeTypeOp, Date32Array, Date64Array, PrimitiveArray};
+    use arrow_array::types::{
+        Decimal128Type, Decimal256Type, DurationMicrosecondType, DurationMillisecondType,
+        DurationNanosecondType, DurationSecondType, Float16Type, Float32Type, Float64Type,
+        IntervalYearMonthType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    };
+    use arrow_array::{
+        ArrowNativeTypeOp, Date32Array, Date64Array, Time32MillisecondArray, Time32SecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow_schema::{IntervalUnit, TimeUnit};
     use chrono::Utc;
-    use rand::distributions::Uniform;
     use rand::prelude::Distribution;
 
     use super::*;
@@ -1036,6 +1265,31 @@ pub mod array {
         )
     }
 
+    /// Create a generator of primitive values that are randomly sampled from the entire range available for the value
+    pub fn rand_with_distribution<
+        DataType,
+        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
+    >(
+        dist: Dist,
+    ) -> Box<dyn ArrayGenerator>
+    where
+        DataType::Native: Copy + 'static,
+        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
+        DataType: ArrowPrimitiveType,
+    {
+        Box::new(
+            FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
+                DataType::DATA_TYPE.clone(),
+                move |rng| rng.sample(dist.clone()),
+                1,
+                DataType::DATA_TYPE
+                    .primitive_width()
+                    .map(|width| ByteCount::from(width as u64))
+                    .expect("Primitive types should have a fixed width"),
+            ),
+        )
+    }
+
     /// Create a generator of 1d vectors (of a primitive type) consisting of randomly sampled primitive values
     pub fn rand_vec<DataType>(dimension: Dimension) -> Box<dyn ArrayGenerator>
     where
@@ -1048,13 +1302,96 @@ pub mod array {
         cycle_vec(underlying, dimension)
     }
 
+    /// Create a generator of randomly sampled time32 values covering the entire
+    /// range of 1 day
+    pub fn rand_time32(resolution: &TimeUnit) -> Box<dyn ArrayGenerator> {
+        let start = 0;
+        let end = match resolution {
+            TimeUnit::Second => 86_400,
+            TimeUnit::Millisecond => 86_400_000,
+            _ => panic!(),
+        };
+
+        let data_type = DataType::Time32(resolution.clone());
+        let size = ByteCount::from(data_type.primitive_width().unwrap() as u64);
+        let dist = Uniform::new(start, end);
+        let sample_fn = move |rng: &mut _| dist.sample(rng);
+
+        match resolution {
+            TimeUnit::Second => Box::new(FnGen::<i32, Time32SecondArray, _>::new_known_size(
+                data_type, sample_fn, 1, size,
+            )),
+            TimeUnit::Millisecond => {
+                Box::new(FnGen::<i32, Time32MillisecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, size,
+                ))
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// Create a generator of randomly sampled time64 values covering the entire
+    /// range of 1 day
+    pub fn rand_time64(resolution: &TimeUnit) -> Box<dyn ArrayGenerator> {
+        let start = 0_i64;
+        let end: i64 = match resolution {
+            TimeUnit::Microsecond => 86_400_000,
+            TimeUnit::Nanosecond => 86_400_000_000,
+            _ => panic!(),
+        };
+
+        let data_type = DataType::Time64(resolution.clone());
+        let size = ByteCount::from(data_type.primitive_width().unwrap() as u64);
+        let dist = Uniform::new(start, end);
+        let sample_fn = move |rng: &mut _| dist.sample(rng);
+
+        match resolution {
+            TimeUnit::Microsecond => {
+                Box::new(FnGen::<i64, Time64MicrosecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, size,
+                ))
+            }
+            TimeUnit::Nanosecond => {
+                Box::new(FnGen::<i64, Time64NanosecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, size,
+                ))
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// Create a generator of random UUIDs, stored as fixed size binary values
+    ///
+    /// Note, these are "pseudo UUIDs".  They are 16-byte randomish values but they
+    /// are not guaranteed to be unique.  We use a simplistic RNG that trades uniqueness
+    /// for speed.
+    pub fn rand_pseduo_uuid() -> Box<dyn ArrayGenerator> {
+        Box::<PseduoUuidGenerator>::default()
+    }
+
+    /// Create a generator of random UUIDs, stored as 32-character strings (hex encoding
+    /// of the 16-byte binary value)
+    ///
+    /// Note, these are "pseudo UUIDs".  They are 16-byte randomish values but they
+    /// are not guaranteed to be unique.  We use a simplistic RNG that trades uniqueness
+    /// for speed.
+    pub fn rand_pseduo_uuid_hex() -> Box<dyn ArrayGenerator> {
+        Box::<PseduoUuidHexGenerator>::default()
+    }
+
+    pub fn rand_primitive<T: ArrowPrimitiveType + Send + Sync>(
+        data_type: DataType,
+    ) -> Box<dyn ArrayGenerator> {
+        Box::new(RandomBytesGenerator::<T>::new(data_type))
+    }
+
     /// Create a generator of randomly sampled date32 values
     ///
     /// Instead of sampling the entire range, all values will be drawn from the last year as this
     /// is a more common use pattern
     pub fn rand_date32() -> Box<dyn ArrayGenerator> {
         let now = chrono::Utc::now();
-        let one_year_ago = now - chrono::Duration::days(365);
+        let one_year_ago = now - chrono::TimeDelta::try_days(365).expect("TimeDelta try days");
         rand_date32_in_range(one_year_ago, now)
     }
 
@@ -1087,8 +1424,67 @@ pub mod array {
     /// is a more common use pattern
     pub fn rand_date64() -> Box<dyn ArrayGenerator> {
         let now = chrono::Utc::now();
-        let one_year_ago = now - chrono::Duration::days(365);
+        let one_year_ago = now - chrono::TimeDelta::try_days(365).expect("TimeDelta try_days");
         rand_date64_in_range(one_year_ago, now)
+    }
+
+    /// Create a generator of randomly sampled timestamp values in the given range
+    ///
+    /// Currently just samples the entire range of u64 values and casts to timestamp
+    pub fn rand_timestamp_in_range(
+        start: chrono::DateTime<Utc>,
+        end: chrono::DateTime<Utc>,
+        data_type: &DataType,
+    ) -> Box<dyn ArrayGenerator> {
+        let end_ms = end.timestamp_millis();
+        let start_ms = start.timestamp_millis();
+        let (start_ticks, end_ticks) = match data_type {
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                (start_ms * 1000 * 1000, end_ms * 1000 * 1000)
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => (start_ms * 1000, end_ms * 1000),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => (start_ms, end_ms),
+            DataType::Timestamp(TimeUnit::Second, _) => (start.timestamp(), end.timestamp()),
+            _ => panic!(),
+        };
+        let dist = Uniform::new(start_ticks, end_ticks);
+
+        let data_type = data_type.clone();
+        let sample_fn = move |rng: &mut _| (dist.sample(rng));
+        let width = data_type
+            .primitive_width()
+            .map(|width| ByteCount::from(width as u64))
+            .unwrap();
+
+        match data_type {
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                Box::new(FnGen::<i64, TimestampNanosecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, width,
+                ))
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                Box::new(FnGen::<i64, TimestampMicrosecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, width,
+                ))
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                Box::new(FnGen::<i64, TimestampMicrosecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, width,
+                ))
+            }
+            DataType::Timestamp(TimeUnit::Second, _) => {
+                Box::new(FnGen::<i64, TimestampSecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, width,
+                ))
+            }
+            _ => panic!(),
+        }
+    }
+
+    pub fn rand_timestamp(data_type: &DataType) -> Box<dyn ArrayGenerator> {
+        let now = chrono::Utc::now();
+        let one_year_ago = now - chrono::Duration::try_days(365).unwrap();
+        rand_timestamp_in_range(one_year_ago, now, data_type)
     }
 
     /// Create a generator of randomly sampled date64 values
@@ -1134,6 +1530,19 @@ pub mod array {
         Box::<RandomBooleanGenerator>::default()
     }
 
+    pub fn rand_list(item_type: &DataType) -> Box<dyn ArrayGenerator> {
+        let child_gen = rand_type(item_type);
+        Box::new(RandomListGenerator::new(child_gen))
+    }
+
+    pub fn rand_struct(fields: Fields) -> Box<dyn ArrayGenerator> {
+        let child_gens = fields
+            .iter()
+            .map(|f| rand_type(f.data_type()))
+            .collect::<Vec<_>>();
+        Box::new(RandomStructGenerator::new(fields, child_gens))
+    }
+
     /// Create a generator of random values
     pub fn rand_type(data_type: &DataType) -> Box<dyn ArrayGenerator> {
         match data_type {
@@ -1146,8 +1555,11 @@ pub mod array {
             DataType::UInt16 => rand::<UInt16Type>(),
             DataType::UInt32 => rand::<UInt32Type>(),
             DataType::UInt64 => rand::<UInt64Type>(),
+            DataType::Float16 => rand_primitive::<Float16Type>(data_type.clone()),
             DataType::Float32 => rand::<Float32Type>(),
             DataType::Float64 => rand::<Float64Type>(),
+            DataType::Decimal128(_, _) => rand_primitive::<Decimal128Type>(data_type.clone()),
+            DataType::Decimal256(_, _) => rand_primitive::<Decimal256Type>(data_type.clone()),
             DataType::Utf8 => rand_utf8(ByteCount::from(12)),
             DataType::Binary => rand_varbin(ByteCount::from(12)),
             DataType::Dictionary(key_type, value_type) => {
@@ -1157,9 +1569,25 @@ pub mod array {
                 rand_type(child.data_type()),
                 Dimension::from(*dimension as u32),
             ),
+            DataType::List(child) => rand_list(child.data_type()),
+            DataType::Duration(unit) => match unit {
+                TimeUnit::Second => rand::<DurationSecondType>(),
+                TimeUnit::Millisecond => rand::<DurationMillisecondType>(),
+                TimeUnit::Microsecond => rand::<DurationMicrosecondType>(),
+                TimeUnit::Nanosecond => rand::<DurationNanosecondType>(),
+            },
+            DataType::Interval(unit) => match unit {
+                IntervalUnit::DayTime => rand::<IntervalDayTimeType>(),
+                IntervalUnit::MonthDayNano => rand::<IntervalMonthDayNanoType>(),
+                IntervalUnit::YearMonth => rand::<IntervalYearMonthType>(),
+            },
             DataType::Date32 => rand_date32(),
             DataType::Date64 => rand_date64(),
-            _ => unimplemented!(),
+            DataType::Time32(resolution) => rand_time32(resolution),
+            DataType::Time64(resolution) => rand_time64(resolution),
+            DataType::Timestamp(_, _) => rand_timestamp(data_type),
+            DataType::Struct(fields) => rand_struct(fields.clone()),
+            _ => unimplemented!("random generation of {}", data_type),
         }
     }
 
@@ -1215,10 +1643,8 @@ pub fn rand(schema: &Schema) -> BatchGeneratorBuilder {
 #[cfg(test)]
 mod tests {
 
-    use arrow_array::{
-        types::{Float32Type, Int16Type, Int32Type, Int8Type, UInt32Type},
-        BooleanArray, Float32Array, Int16Array, Int32Array, Int8Array, StringArray, UInt32Array,
-    };
+    use arrow::datatypes::{Float32Type, Int16Type, Int8Type, UInt32Type};
+    use arrow_array::{BooleanArray, Float32Array, Int16Array, Int32Array, Int8Array, UInt32Array};
 
     use super::*;
 
@@ -1349,6 +1775,19 @@ mod tests {
         // Sanity check to ensure we're getting at least some rng
         assert!(bools.false_count() > 100);
         assert!(bools.true_count() > 100);
+    }
+
+    #[test]
+    fn test_rng_list() {
+        // Note: these tests are heavily dependent on the default seed.
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+        let mut gen = array::rand_list(&DataType::Int32);
+        let arr = gen.generate(RowCount::from(100), &mut rng).unwrap();
+        // Make sure we can generate empty lists (note, test is dependent on seed)
+        let arr = arr.as_list::<i32>();
+        assert!(arr.iter().any(|l| l.unwrap().is_empty()));
+        // Shouldn't generate any giant lists (don't kill performance in normal datagen)
+        assert!(arr.iter().any(|l| l.unwrap().len() < 11));
     }
 
     #[test]

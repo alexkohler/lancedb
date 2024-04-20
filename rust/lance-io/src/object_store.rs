@@ -1,21 +1,10 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Extend [object_store::ObjectStore] functionalities
 
 use std::collections::HashMap;
-use std::path::{Path as StdPath, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -28,13 +17,11 @@ use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
 };
-use object_store::azure::AzureConfigKey;
-use object_store::gcp::GoogleConfigKey;
 use object_store::{
-    aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory, CredentialProvider,
-    Error as ObjectStoreError, Result as ObjectStoreResult,
+    aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
+    memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
 };
-use object_store::{parse_url_opts, DynObjectStore, RetryConfig, BackoffConfig};
+use object_store::{parse_url_opts, ClientOptions, DynObjectStore, StaticCredentialProvider};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use shellexpand::tilde;
 use snafu::{location, Location};
@@ -42,7 +29,6 @@ use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
 use super::local::LocalObjectReader;
-
 mod tracing;
 use self::tracing::ObjectStoreTracingExt;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
@@ -186,40 +172,113 @@ impl CredentialProvider for AwsCredentialAdapter {
     }
 }
 
+/// Figure out the S3 region of the bucket.
+///
+/// This resolves in order of precedence:
+/// 1. The region provided in the storage options
+/// 2. (If endpoint is not set), the region returned by the S3 API for the bucket
+///
+/// It can return None if no region is provided and the endpoint is set.
+async fn resolve_s3_region(
+    url: &Url,
+    storage_options: &HashMap<AmazonS3ConfigKey, String>,
+) -> Result<Option<String>> {
+    if let Some(region) = storage_options.get(&AmazonS3ConfigKey::Region) {
+        Ok(Some(region.clone()))
+    } else if storage_options.get(&AmazonS3ConfigKey::Endpoint).is_none() {
+        // If no endpoint is set, we can assume this is AWS S3 and the region
+        // can be resolved from the bucket.
+        let bucket = url.host_str().ok_or_else(|| {
+            Error::invalid_input(
+                format!("Could not parse bucket from url: {}", url),
+                location!(),
+            )
+        })?;
+
+        let mut client_options = ClientOptions::default();
+        for (key, value) in storage_options {
+            if let AmazonS3ConfigKey::Client(client_key) = key {
+                client_options = client_options.with_config(*client_key, value.clone());
+            }
+        }
+
+        let bucket_region =
+            object_store::aws::resolve_bucket_region(bucket, &client_options).await?;
+        Ok(Some(bucket_region))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Build AWS credentials
+///
+/// This resolves credentials from the following sources in order:
+/// 1. An explicit `credentials` provider
+/// 2. Explicit credentials in storage_options (as in `aws_access_key_id`,
+///    `aws_secret_access_key`, `aws_session_token`)
+/// 3. The default credential provider chain from AWS SDK.
+///
 /// `credentials_refresh_offset` is the amount of time before expiry to refresh credentials.
 pub async fn build_aws_credential(
     credentials_refresh_offset: Duration,
     credentials: Option<AwsCredentialProvider>,
+    storage_options: Option<&HashMap<AmazonS3ConfigKey, String>>,
     region: Option<String>,
 ) -> Result<(AwsCredentialProvider, String)> {
+    // TODO: make this return no credential provider not using AWS
     use aws_config::meta::region::RegionProviderChain;
     const DEFAULT_REGION: &str = "us-west-2";
-    let region_provider = RegionProviderChain::default_provider().or_else(DEFAULT_REGION);
-    let region = region.unwrap_or(
-        region_provider
+
+    let region = if let Some(region) = region {
+        region
+    } else {
+        RegionProviderChain::default_provider()
+            .or_else(DEFAULT_REGION)
             .region()
             .await
             .map(|r| r.as_ref().to_string())
-            .unwrap_or(DEFAULT_REGION.to_string()),
-    );
+            .unwrap_or(DEFAULT_REGION.to_string())
+    };
 
-    let creds = match credentials {
-        Some(creds) => creds,
-        None => {
-            let credentials_provider = DefaultCredentialsChain::builder()
-                .region(region_provider.region().await)
-                .build()
-                .await;
+    if let Some(creds) = credentials {
+        Ok((creds, region))
+    } else if let Some(creds) = storage_options.and_then(extract_static_s3_credentials) {
+        Ok((Arc::new(creds), region))
+    } else {
+        let credentials_provider = DefaultCredentialsChain::builder().build().await;
 
+        Ok((
             Arc::new(AwsCredentialAdapter::new(
                 Arc::new(credentials_provider),
                 credentials_refresh_offset,
-            ))
-        }
-    };
+            )),
+            region,
+        ))
+    }
+}
 
-    Ok((creds, region))
+fn extract_static_s3_credentials(
+    options: &HashMap<AmazonS3ConfigKey, String>,
+) -> Option<StaticCredentialProvider<ObjectStoreAwsCredential>> {
+    let key_id = options
+        .get(&AmazonS3ConfigKey::AccessKeyId)
+        .map(|s| s.to_string());
+    let secret_key = options
+        .get(&AmazonS3ConfigKey::SecretAccessKey)
+        .map(|s| s.to_string());
+    let token = options
+        .get(&AmazonS3ConfigKey::Token)
+        .map(|s| s.to_string());
+    match (key_id, secret_key, token) {
+        (Some(key_id), Some(secret_key), token) => {
+            Some(StaticCredentialProvider::new(ObjectStoreAwsCredential {
+                key_id,
+                secret_key,
+                token,
+            }))
+        }
+        _ => None,
+    }
 }
 
 pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
@@ -309,49 +368,32 @@ impl ObjectStore {
 
     pub fn from_path(str_path: &str) -> Result<(Self, Path)> {
         let expanded = tilde(str_path).to_string();
-        let expanded_path = StdPath::new(&expanded);
 
-        if !expanded_path.try_exists()? {
-            std::fs::create_dir_all(expanded_path)?;
+        let mut expanded_path = path_abs::PathAbs::new(expanded)
+            .unwrap()
+            .as_path()
+            .to_path_buf();
+        // path_abs::PathAbs::new(".") returns an empty string.
+        if let Some(s) = expanded_path.as_path().to_str() {
+            if s.is_empty() {
+                expanded_path = std::env::current_dir()?.to_path_buf();
+            }
         }
-
-        let expanded_path = expanded_path.canonicalize()?;
-
         Ok((
             Self {
                 inner: Arc::new(LocalFileSystem::new()).traced(),
                 scheme: String::from("file"),
-                base_path: Path::from_absolute_path(&expanded_path)?,
+                base_path: Path::from_absolute_path(expanded_path.as_path())?,
                 block_size: 4 * 1024, // 4KB block size
             },
-            Path::from_filesystem_path(&expanded_path)?,
-        ))
-    }
-
-    fn new_from_path(str_path: &str) -> Result<(Self, Path)> {
-        let expanded = tilde(str_path).to_string();
-        let expanded_path = StdPath::new(&expanded);
-
-        if !expanded_path.try_exists()? {
-            std::fs::create_dir_all(expanded_path)?;
-        }
-
-        let expanded_path = expanded_path.canonicalize()?;
-
-        Ok((
-            Self {
-                inner: Arc::new(LocalFileSystem::new()).traced(),
-                scheme: String::from("file"),
-                base_path: Path::from_absolute_path(&expanded_path)?,
-                block_size: 4 * 1024, // 4KB block size
-            },
-            Path::from_filesystem_path(&expanded_path)?,
+            Path::from_absolute_path(expanded_path.as_path())?,
         ))
     }
 
     async fn new_from_url(url: Url, params: ObjectStoreParams) -> Result<Self> {
         configure_store(url.as_str(), params).await
     }
+
     /// Local object store.
     pub fn local() -> Self {
         Self {
@@ -636,13 +678,11 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             // }
 
             let storage_options = storage_options.as_s3_options();
-            let region = storage_options
-                .get(&AmazonS3ConfigKey::Region)
-                .map(|s| s.to_string());
-
+            let region = resolve_s3_region(&url, &storage_options).await?;
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
+                Some(&storage_options),
                 region,
             )
             .await?;
@@ -680,9 +720,13 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             builder = builder
                 .with_url(url.as_ref())
                 .with_credentials(aws_creds)
+<<<<<<< HEAD
                 .with_region(region)
                 .with_retry(retry_config)
                 .with_allow_http(true);
+=======
+                .with_region(region);
+>>>>>>> main
             let store = builder.build()?;
 
             Ok(ObjectStore {
@@ -717,7 +761,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 block_size: 64 * 1024,
             })
         }
-        "file" => Ok(ObjectStore::new_from_path(url.path())?.0),
+        "file" => Ok(ObjectStore::from_path(url.path())?.0),
         "memory" => Ok(ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
@@ -850,6 +894,7 @@ mod tests {
     use parquet::data_type::AsBytes;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
+    use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Write test content to file.

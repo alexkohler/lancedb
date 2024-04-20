@@ -48,6 +48,8 @@ cmake-build-*
 
 python/lance/_*.cpp
 
+bin/
+
 
 *.parquet
 *.parq
@@ -88,6 +90,7 @@ wheelhouse
 # Rust
 target
 Cargo.lock
+**/sccache.log
 
 # c++ lsp
 .ccls-cache/

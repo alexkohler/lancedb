@@ -1,19 +1,5 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::ArrowError;
 use snafu::{Location, Snafu};
@@ -86,10 +72,13 @@ pub enum Error {
     InvalidTableLocation { message: String },
     /// Stream early stop
     Stop,
+    #[snafu(display("Wrapped error: {error}, {location}"))]
     Wrapped {
         error: BoxedError,
         location: Location,
     },
+    #[snafu(display("Cloned error: {message}, {location}"))]
+    Cloned { message: String, location: Location },
 }
 
 impl Error {
@@ -170,6 +159,16 @@ impl From<object_store::Error> for Error {
 impl From<prost::DecodeError> for Error {
     #[track_caller]
     fn from(e: prost::DecodeError) -> Self {
+        Self::IO {
+            message: (e.to_string()),
+            location: std::panic::Location::caller().to_snafu_location(),
+        }
+    }
+}
+
+impl From<prost::EncodeError> for Error {
+    #[track_caller]
+    fn from(e: prost::EncodeError) -> Self {
         Self::IO {
             message: (e.to_string()),
             location: std::panic::Location::caller().to_snafu_location(),
@@ -294,6 +293,32 @@ impl From<Error> for object_store::Error {
 #[track_caller]
 pub fn get_caller_location() -> &'static std::panic::Location<'static> {
     std::panic::Location::caller()
+}
+
+/// Wrap an error in a new error type that implements Clone
+///
+/// This is useful when two threads/streams share a common fallible source
+/// The base error will always have the full error.  Any cloned results will
+/// only have Error::Cloned with the to_string of the base error.
+pub struct CloneableError(pub Error);
+
+impl Clone for CloneableError {
+    #[track_caller]
+    fn clone(&self) -> Self {
+        Self(Error::Cloned {
+            message: self.0.to_string(),
+            location: std::panic::Location::caller().to_snafu_location(),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct CloneableResult<T: Clone>(pub std::result::Result<T, CloneableError>);
+
+impl<T: Clone> From<Result<T>> for CloneableResult<T> {
+    fn from(result: Result<T>) -> Self {
+        Self(result.map_err(CloneableError))
+    }
 }
 
 #[cfg(test)]

@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Statistics collection utilities
 
@@ -945,15 +934,14 @@ impl StatisticsBuilder {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        builder::StringDictionaryBuilder, make_array, new_empty_array, new_null_array,
-        types::ArrowPrimitiveType, BinaryArray, BooleanArray, Date32Array, Date64Array, Datum,
-        Decimal128Array, DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
-        DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float32Array,
-        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-        LargeStringArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
-        UInt32Array, UInt64Array, UInt8Array,
+        builder::StringDictionaryBuilder, make_array, new_empty_array, new_null_array, BinaryArray,
+        BooleanArray, Date32Array, Date64Array, Datum, Decimal128Array, DictionaryArray,
+        DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
+        DurationSecondArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array,
+        Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, StringArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow_select::interleave::interleave;
     use num_traits::One;

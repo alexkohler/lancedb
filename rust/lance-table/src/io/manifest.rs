@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use std::{ops::Range, sync::Arc};
 
 use async_trait::async_trait;
@@ -200,11 +203,9 @@ impl ManifestProvider for ManifestDescribing {
 mod test {
     use arrow_array::{Int32Array, RecordBatch};
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use crate::format::SelfDescribingFileReader;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use lance_core::datatypes::Schema;
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
     use lance_file::{reader::FileReader, writer::FileWriter};
     use rand::{distributions::Alphanumeric, Rng};
@@ -286,7 +287,8 @@ mod test {
         metadata.insert(String::from("lance:extra"), String::from("for_test"));
         file_writer.finish_with_metadata(&metadata).await.unwrap();
 
-        let reader = FileReader::try_new_self_described(&store, &path, None)
+        let reader = store.open(&path).await.unwrap();
+        let reader = FileReader::try_new_self_described_from_reader(reader.into(), None)
             .await
             .unwrap();
         let schema = ArrowSchema::from(reader.schema());

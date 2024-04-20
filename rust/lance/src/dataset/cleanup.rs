@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! A task to clean up a lance dataset, removing files that are no longer
 //! needed.
@@ -44,7 +33,7 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
@@ -217,7 +206,8 @@ impl<'a> CleanupTask<'a> {
         inspection: CleanupInspection,
     ) -> Result<RemovalStats> {
         let removal_stats = Mutex::new(RemovalStats::default());
-        let verification_threshold = utc_now() - Duration::days(UNVERIFIED_THRESHOLD_DAYS);
+        let verification_threshold = utc_now()
+            - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
         let unreferenced_paths = self
             .dataset
             .object_store
@@ -448,18 +438,11 @@ pub async fn cleanup_partial_writes(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, Mutex},
-    };
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow_array::{RecordBatchIterator, RecordBatchReader};
-    use chrono::Duration;
-    use lance_core::{
-        utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy},
-        Error, Result,
-    };
+    use lance_core::utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_io::object_store::{ObjectStoreParams, WrappingObjectStore};
     use lance_linalg::distance::MetricType;
@@ -470,7 +453,6 @@ mod tests {
     use crate::{
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         index::vector::VectorIndexParams,
-        io::ObjectStore,
     };
     use all_asserts::{assert_gt, assert_lt};
     use tempfile::{tempdir, TempDir};
@@ -731,7 +713,7 @@ mod tests {
 
         async fn count_rows(&self) -> Result<usize> {
             let db = self.open().await?;
-            let count = db.count_rows().await?;
+            let count = db.count_rows(None).await?;
             Ok(count)
         }
     }
@@ -745,12 +727,14 @@ mod tests {
         fixture.create_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
 
-        fixture.clock.set_system_time(Duration::days(10));
+        fixture
+            .clock
+            .set_system_time(TimeDelta::try_days(10).unwrap());
 
         let before_count = fixture.count_files().await.unwrap();
 
         let removed = fixture
-            .run_cleanup(utc_now() - Duration::days(8))
+            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
             .await
             .unwrap();
 
@@ -784,7 +768,9 @@ mod tests {
         // remain if they are still referenced by newer manifests
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
-        fixture.clock.set_system_time(Duration::days(10));
+        fixture
+            .clock
+            .set_system_time(TimeDelta::try_days(10).unwrap());
         fixture.append_some_data().await.unwrap();
         fixture.append_some_data().await.unwrap();
 
@@ -794,7 +780,7 @@ mod tests {
         assert_eq!(before_count.num_data_files, 3);
         assert_eq!(before_count.num_manifest_files, 4);
 
-        let before = utc_now() - Duration::days(7);
+        let before = utc_now() - TimeDelta::try_days(7).unwrap();
         let removed = fixture.run_cleanup(before).await.unwrap();
 
         let after_count = fixture.count_files().await.unwrap();
@@ -817,7 +803,9 @@ mod tests {
     async fn cleanup_recent_verified_files() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
-        fixture.clock.set_system_time(Duration::seconds(1));
+        fixture
+            .clock
+            .set_system_time(TimeDelta::try_seconds(1).unwrap());
         fixture.overwrite_some_data().await.unwrap();
 
         let before_count = fixture.count_files().await.unwrap();
@@ -854,9 +842,9 @@ mod tests {
             assert!(fixture.append_some_data().await.is_err());
 
             let age = if old_files {
-                Duration::days(UNVERIFIED_THRESHOLD_DAYS + 1)
+                TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS + 1).unwrap()
             } else {
-                Duration::days(UNVERIFIED_THRESHOLD_DAYS - 1)
+                TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS - 1).unwrap()
             };
             fixture.clock.set_system_time(age);
 
@@ -896,7 +884,9 @@ mod tests {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
         fixture.create_some_index().await.unwrap();
-        fixture.clock.set_system_time(Duration::days(10));
+        fixture
+            .clock
+            .set_system_time(TimeDelta::try_days(10).unwrap());
         fixture.overwrite_some_data().await.unwrap();
 
         let before_count = fixture.count_files().await.unwrap();
@@ -906,7 +896,7 @@ mod tests {
         // Creating an index creates a new manifest so there are 4 total
         assert_eq!(before_count.num_manifest_files, 4);
 
-        let before = utc_now() - Duration::days(8);
+        let before = utc_now() - TimeDelta::try_days(8).unwrap();
         let removed = fixture.run_cleanup(before).await.unwrap();
 
         let after_count = fixture.count_files().await.unwrap();
@@ -934,7 +924,9 @@ mod tests {
         // This will keep some data from the appended file and should
         // completely remove the first file
         fixture.delete_data("filter_me < 20").await.unwrap();
-        fixture.clock.set_system_time(Duration::days(10));
+        fixture
+            .clock
+            .set_system_time(TimeDelta::try_days(10).unwrap());
         fixture.overwrite_data(data_gen.batch(16)).await.unwrap();
         // This will delete half of the last fragment
         fixture.delete_data("filter_me >= 40").await.unwrap();
@@ -944,7 +936,7 @@ mod tests {
         assert_eq!(before_count.num_delete_files, 2);
         assert_eq!(before_count.num_manifest_files, 6);
 
-        let before = utc_now() - Duration::days(8);
+        let before = utc_now() - TimeDelta::try_days(8).unwrap();
         let removed = fixture.run_cleanup(before).await.unwrap();
 
         let after_count = fixture.count_files().await.unwrap();
@@ -970,12 +962,14 @@ mod tests {
         // by any fragment.  We need to make sure the cleanup routine
         // doesn't over-zealously delete these
         let fixture = MockDatasetFixture::try_new().unwrap();
-        fixture.clock.set_system_time(Duration::days(10));
+        fixture
+            .clock
+            .set_system_time(TimeDelta::try_days(10).unwrap());
         fixture.create_some_data().await.unwrap();
         fixture.create_some_index().await.unwrap();
 
         let before_count = fixture.count_files().await.unwrap();
-        let before = utc_now() - Duration::days(8);
+        let before = utc_now() - TimeDelta::try_days(8).unwrap();
         let removed = fixture.run_cleanup(before).await.unwrap();
         assert_eq!(removed.old_versions, 0);
         assert_eq!(removed.bytes_removed, 0);
@@ -994,7 +988,9 @@ mod tests {
         fixture.create_some_data().await.unwrap();
         fixture.block_commits();
         assert!(fixture.append_some_data().await.is_err());
-        fixture.clock.set_system_time(Duration::days(10));
+        fixture
+            .clock
+            .set_system_time(TimeDelta::try_days(10).unwrap());
 
         let before_count = fixture.count_files().await.unwrap();
         // This append will fail since the commit is blocked but it should have
@@ -1006,7 +1002,7 @@ mod tests {
         // All of our manifests are newer than the threshold but temp files
         // should still be deleted.
         let removed = fixture
-            .run_cleanup(utc_now() - Duration::days(7))
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
             .await
             .unwrap();
 
@@ -1031,7 +1027,9 @@ mod tests {
         // but the cleanup routine has no way of detecting this.  They should look
         // just like an in-progress write.
         let mut fixture = MockDatasetFixture::try_new().unwrap();
-        fixture.clock.set_system_time(Duration::days(10));
+        fixture
+            .clock
+            .set_system_time(TimeDelta::try_days(10).unwrap());
         fixture.create_some_data().await.unwrap();
         fixture.block_commits();
         assert!(fixture.append_some_data().await.is_err());
@@ -1039,7 +1037,7 @@ mod tests {
         let before_count = fixture.count_files().await.unwrap();
 
         let removed = fixture
-            .run_cleanup(utc_now() - Duration::days(7))
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
             .await
             .unwrap();
 
@@ -1056,7 +1054,9 @@ mod tests {
         // prevent us from running cleanup again later.
         let mut fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
-        fixture.clock.set_system_time(Duration::days(10));
+        fixture
+            .clock
+            .set_system_time(TimeDelta::try_days(10).unwrap());
         fixture.overwrite_some_data().await.unwrap();
 
         // The delete operation should delete the first version and its
@@ -1069,7 +1069,7 @@ mod tests {
         assert_eq!(before_count.num_manifest_files, 3);
 
         assert!(fixture
-            .run_cleanup(utc_now() - Duration::days(7))
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
             .await
             .is_err());
 
@@ -1085,7 +1085,7 @@ mod tests {
         fixture.unblock_delete_manifest();
 
         let removed = fixture
-            .run_cleanup(utc_now() - Duration::days(7))
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
             .await
             .unwrap();
 

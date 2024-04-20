@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Lance secondary index library
 
@@ -33,7 +22,12 @@ pub mod vector;
 pub use crate::traits::*;
 
 pub const INDEX_FILE_NAME: &str = "index.idx";
-const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
+/// The name of the auxiliary index file.
+///
+/// This file is used to store additional information about the index, to improve performance.
+/// - For 'IVF_HNSW' index, it stores the partitioned PQ Storage.
+pub const INDEX_AUXILIARY_FILE_NAME: &str = "auxiliary.idx";
+pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 
 pub mod pb {
     #![allow(clippy::use_self)]
@@ -87,8 +81,8 @@ pub trait IndexParams: Send + Sync {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub(crate) struct IndexMetadata {
+pub struct IndexMetadata {
     #[serde(rename = "type")]
     pub index_type: String,
-    pub metric_type: String,
+    pub distance_type: String,
 }

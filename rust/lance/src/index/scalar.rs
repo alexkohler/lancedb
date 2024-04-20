@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Utilities for integrating scalar indices with datasets
 //!
@@ -19,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use lance_datafusion::chunker::chunk_concat_stream;
+use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::scalar::{
     btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
     flat::FlatIndexMetadata,
@@ -63,7 +52,12 @@ impl BtreeTrainingSource for TrainingRequest {
             )]))?
             .project(&[&self.column])?;
 
-        let ordered_batches = scan.try_into_dfstream().await?;
+        let ordered_batches = scan
+            .try_into_dfstream(LanceExecutionOptions {
+                use_spilling: true,
+                ..Default::default()
+            })
+            .await?;
         Ok(chunk_concat_stream(ordered_batches, chunk_size as usize))
     }
 }

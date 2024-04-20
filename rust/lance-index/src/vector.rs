@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Vector Index
 //!
@@ -25,12 +14,15 @@ pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;
 pub mod pq;
+pub mod quantizer;
 pub mod residual;
+pub mod sq;
 pub mod transform;
 pub mod utils;
 
 // TODO: Make these crate private once the migration from lance to lance-index is done.
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
+pub const SQ_CODE_COLUMN: &str = "__sq_code";
 pub const PART_ID_COLUMN: &str = "__ivf_part_id";
 pub const DIST_COL: &str = "_distance";
 
@@ -51,6 +43,10 @@ pub struct Query {
 
     /// The number of probes to load and search.
     pub nprobes: usize,
+
+    /// The number of candidates to reserve while searching.
+    /// this is an optional parameter for HNSW related index types.
+    pub ef: Option<usize>,
 
     /// If presented, apply a refine step.
     /// TODO: should we support fraction / float number here?

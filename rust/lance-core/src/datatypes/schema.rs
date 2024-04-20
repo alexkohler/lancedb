@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Schema
 
@@ -232,6 +221,12 @@ impl Schema {
         // Check for duplicate field ids
         let mut seen_ids = HashSet::new();
         for field in self.fields_pre_order() {
+            if field.id < 0 {
+                return Err(Error::Schema {
+                    message: format!("Field {} has a negative id {}", field.name, field.id),
+                    location: location!(),
+                });
+            }
             if !seen_ids.insert(field.id) {
                 return Err(Error::Schema {
                     message: format!("Duplicate field id {} in schema {:?}", field.id, self),
@@ -350,6 +345,10 @@ impl Schema {
             })
     }
 
+    pub fn top_level_field_ids(&self) -> Vec<i32> {
+        self.fields.iter().map(|f| f.id).collect()
+    }
+
     // Recursively collect all the field IDs, in pre-order traversal order.
     // TODO: pub(crate)
     pub fn field_ids(&self) -> Vec<i32> {
@@ -402,6 +401,11 @@ impl Schema {
     }
 
     // TODO: pub(crate)
+    /// Get the maximum field id in the schema.
+    ///
+    /// Note: When working with Datasets, you should prefer [Manifest::max_field_id()]
+    /// over this method. This method does not take into account the field IDs
+    /// of dropped fields.
     pub fn max_field_id(&self) -> Option<i32> {
         self.fields.iter().map(|f| f.max_id()).max()
     }
@@ -421,8 +425,20 @@ impl Schema {
         Ok(())
     }
 
-    fn set_field_id(&mut self) {
-        let mut current_id = self.max_field_id().unwrap_or(-1) + 1;
+    /// Walk through the fields and assign a new field id to each field that does
+    /// not have one (e.g. is set to -1)
+    ///
+    /// If this schema is on an existing dataset, pass the result of
+    /// `Manifest::max_field_id` to `max_existing_id`. If for some reason that
+    /// id is lower than the maximum field id in this schema, the field IDs will
+    /// be reassigned starting from the maximum field id in this schema.
+    ///
+    /// If this schema is not associated with a dataset, pass `None` to
+    /// `max_existing_id`. This is the same as passing [Self::max_field_id()].
+    pub fn set_field_id(&mut self, max_existing_id: Option<i32>) {
+        let schema_max_id = self.max_field_id().unwrap_or(-1);
+        let max_existing_id = max_existing_id.unwrap_or(-1);
+        let mut current_id = schema_max_id.max(max_existing_id) + 1;
         self.fields
             .iter_mut()
             .for_each(|f| f.set_id(-1, &mut current_id));
@@ -450,7 +466,6 @@ impl Schema {
                 location: location!(),
             })
         } else {
-            self.set_field_id();
             Ok(())
         }
     }
@@ -485,11 +500,10 @@ impl Schema {
             .chain(other.metadata.iter())
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let mut schema = Self {
+        let schema = Self {
             fields: merged_fields,
             metadata,
         };
-        schema.set_field_id();
         Ok(schema)
     }
 }
@@ -522,7 +536,7 @@ impl TryFrom<&ArrowSchema> for Schema {
                 .collect::<Result<_>>()?,
             metadata: schema.metadata.clone(),
         };
-        schema.set_field_id();
+        schema.set_field_id(None);
 
         Ok(schema)
     }
@@ -604,7 +618,8 @@ mod tests {
             ),
             ArrowField::new("c", DataType::Float64, false),
         ]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        schema.set_field_id(None);
         let projected = schema.project_by_ids(&[2, 4, 5]);
 
         let expected_arrow_schema = ArrowSchema::new(vec![
@@ -836,13 +851,22 @@ mod tests {
         // It is already assigned with field ids.
         assert_eq!(to_merged.max_field_id(), Some(1));
 
-        let merged = schema.merge(&to_merged).unwrap();
-        assert_eq!(merged.max_field_id(), Some(7));
+        let mut merged = schema.merge(&to_merged).unwrap();
+        assert_eq!(merged.max_field_id(), Some(5));
 
         let field = merged.field("d").unwrap();
-        assert_eq!(field.id, 6);
+        assert_eq!(field.id, -1);
         let field = merged.field("e").unwrap();
-        assert_eq!(field.id, 7);
+        assert_eq!(field.id, -1);
+
+        // Need to explicitly assign field ids. Testing we can pass a larger
+        // field id to set_field_id.
+        merged.set_field_id(Some(7));
+        let field = merged.field("d").unwrap();
+        assert_eq!(field.id, 8);
+        let field = merged.field("e").unwrap();
+        assert_eq!(field.id, 9);
+        assert_eq!(merged.max_field_id(), Some(9));
     }
 
     #[test]
@@ -868,7 +892,8 @@ mod tests {
             ArrowField::new("d", DataType::Int32, false),
             ArrowField::new("e", DataType::Binary, false),
         ]);
-        let merged = schema.merge(&to_merged_arrow_schema).unwrap();
+        let mut merged = schema.merge(&to_merged_arrow_schema).unwrap();
+        merged.set_field_id(None);
         assert_eq!(merged.max_field_id(), Some(7));
 
         let field = merged.field("d").unwrap();
@@ -940,7 +965,8 @@ mod tests {
             .id = 4;
         expected_schema.fields[0].child_mut("f2").unwrap().id = 3;
 
-        let result = schema1.merge(&schema2).unwrap();
+        let mut result = schema1.merge(&schema2).unwrap();
+        result.set_field_id(None);
         assert_eq!(result, expected_schema);
     }
 

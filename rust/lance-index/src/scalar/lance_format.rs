@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
@@ -167,7 +156,7 @@ mod tests {
         types::{Float32Type, Int32Type, UInt64Type},
         RecordBatchIterator, RecordBatchReader, UInt64Array,
     };
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
@@ -543,6 +532,14 @@ mod tests {
             DataType::Utf8,
             DataType::Float32,
             DataType::Date32,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Date64,
+            DataType::Date32,
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Time32(TimeUnit::Second),
+            // Not supported today, error from datafusion:
+            // Min/max accumulator not implemented for Duration(Nanosecond)
+            // DataType::Duration(TimeUnit::Nanosecond),
         ] {
             let tempdir = tempdir().unwrap();
             let index_store = test_store(&tempdir);

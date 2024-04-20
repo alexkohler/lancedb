@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Product Quantization storage
 //!
@@ -24,7 +13,8 @@ use arrow_array::{
     FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_schema::SchemaRef;
-use lance_core::{Error, Result, ROW_ID};
+use async_trait::async_trait;
+use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
     object_store::ObjectStore,
@@ -42,21 +32,84 @@ use crate::{
     pb,
     vector::{
         graph::storage::{DistCalculator, VectorStorage},
+        ivf::storage::IvfData,
         pq::transform::PQTransformer,
+        quantizer::{QuantizerMetadata, QuantizerStorage},
         transform::Transformer,
         PQ_CODE_COLUMN,
     },
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
 };
 
-const PQ_METADTA_KEY: &str = "lance:pq";
+pub const PQ_METADTA_KEY: &str = "lance:pq";
 
-#[derive(Serialize, Deserialize)]
-struct ProductQuantizationMetadata {
-    codebook_position: usize,
-    num_bits: u32,
-    num_sub_vectors: usize,
-    dimension: usize,
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ProductQuantizationMetadata {
+    pub codebook_position: usize,
+    pub num_bits: u32,
+    pub num_sub_vectors: usize,
+    pub dimension: usize,
+
+    #[serde(skip)]
+    pub codebook: Option<FixedSizeListArray>,
+}
+
+#[async_trait]
+impl QuantizerMetadata for ProductQuantizationMetadata {
+    async fn load(reader: &FileReader) -> Result<Self> {
+        let metadata = reader
+            .schema()
+            .metadata
+            .get(PQ_METADTA_KEY)
+            .ok_or(Error::Index {
+                message: format!(
+                    "Reading PQ storage: metadata key {} not found",
+                    PQ_METADTA_KEY
+                ),
+                location: location!(),
+            })?;
+        let mut metadata: Self = serde_json::from_str(metadata).map_err(|_| Error::Index {
+            message: format!("Failed to parse PQ metadata: {}", metadata),
+            location: location!(),
+        })?;
+
+        let codebook_tensor: pb::Tensor =
+            read_message(reader.object_reader.as_ref(), metadata.codebook_position).await?;
+        metadata.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
+        Ok(metadata)
+    }
+}
+
+/// Write partition of PQ storage to disk.
+#[allow(dead_code)]
+pub async fn write_parted_product_quantizations(
+    object_store: &ObjectStore,
+    path: &Path,
+    partitions: Box<dyn Iterator<Item = ProductQuantizationStorage>>,
+) -> Result<()> {
+    let mut peek = partitions.peekable();
+    let first = peek.peek().ok_or(Error::Index {
+        message: "No partitions to write".to_string(),
+        location: location!(),
+    })?;
+    let schema = first.schema();
+    let lance_schema = Schema::try_from(schema.as_ref())?;
+    let mut writer = FileWriter::<ManifestDescribing>::try_new(
+        object_store,
+        path,
+        lance_schema,
+        &Default::default(), // TODO: support writer options.
+    )
+    .await?;
+
+    let mut ivf_data = IvfData::empty();
+    for storage in peek {
+        let num_rows = storage.write_partition(&mut writer).await?;
+        ivf_data.add_partition(num_rows as u32);
+    }
+    ivf_data.write(&mut writer).await?;
+
+    Ok(())
 }
 
 /// Product Quantization Storage
@@ -157,6 +210,9 @@ impl ProductQuantizationStorage {
         })
     }
 
+    pub fn batch(&self) -> &RecordBatch {
+        &self.batch
+    }
     /// Build a PQ storage from ProductQuantizer and a RecordBatch.
     ///
     /// Parameters
@@ -224,53 +280,40 @@ impl ProductQuantizationStorage {
                 message: format!("Failed to parse index metadata: {}", metadata_str),
                 location: location!(),
             })?;
-        let metric_type: MetricType = MetricType::try_from(index_metadata.metric_type.as_str())?;
+        let metric_type: MetricType = MetricType::try_from(index_metadata.distance_type.as_str())?;
 
-        let metadata = schema.metadata.get(PQ_METADTA_KEY).ok_or(Error::Index {
-            message: format!(
-                "Reading PQ storage: metadata key {} not found",
-                PQ_METADTA_KEY
-            ),
-            location: location!(),
-        })?;
-        let pq_matadata: ProductQuantizationMetadata =
-            serde_json::from_str(metadata).map_err(|_| Error::Index {
-                message: format!("Failed to parse PQ metadata: {}", metadata),
-                location: location!(),
-            })?;
-        let codebook_tensor: pb::Tensor =
-            read_message(reader.object_reader.as_ref(), pq_matadata.codebook_position).await?;
-        let fsl = FixedSizeListArray::try_from(&codebook_tensor)?;
-
-        // Hard coded to float32 for now
-        let codebook = Arc::new(fsl.values().as_primitive::<Float32Type>().clone());
-
-        let total = reader.len();
-        let batch = reader.read_range(0..total, schema, None).await?;
-
-        Self::new(
-            codebook,
-            batch,
-            pq_matadata.num_bits,
-            pq_matadata.num_sub_vectors,
-            pq_matadata.dimension,
-            metric_type,
-        )
+        let metadata = ProductQuantizationMetadata::load(&reader).await?;
+        Self::load_partition(&reader, 0..reader.len(), metric_type, &metadata).await
     }
 
     pub fn schema(&self) -> SchemaRef {
         self.batch.schema()
     }
 
-    #[allow(dead_code)]
     pub fn get_row_ids(&self, ids: &[u32]) -> Vec<u64> {
         ids.iter()
             .map(|&id| self.row_ids.value(id as usize))
             .collect()
     }
 
+    /// Write the PQ storage as a Lance partition to disk,
+    /// and returns the number of rows written.
+    ///
+    pub async fn write_partition(
+        &self,
+        writer: &mut FileWriter<ManifestDescribing>,
+    ) -> Result<usize> {
+        let batch_size: usize = 10240; // TODO: make it configurable
+        for offset in (0..self.batch.num_rows()).step_by(batch_size) {
+            let length = min(batch_size, self.batch.num_rows() - offset);
+            let slice = self.batch.slice(offset, length);
+            writer.write(&[slice]).await?;
+        }
+        Ok(self.batch.num_rows())
+    }
+
     /// Write the PQ storage to disk.
-    pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
+    pub async fn write_full(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
         let pos = writer.object_writer.tell().await?;
         let mat = MatrixView::<Float32Type>::new(self.codebook.clone(), self.dimension);
         let codebook_tensor = pb::Tensor::from(&mat);
@@ -279,24 +322,19 @@ impl ProductQuantizationStorage {
             .write_protobuf(&codebook_tensor)
             .await?;
 
+        self.write_partition(writer).await?;
+
         let metadata = ProductQuantizationMetadata {
             codebook_position: pos,
             num_bits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
+            codebook: None,
         };
-
-        let batch_size: usize = 10240; // TODO: make it configurable
-        for i in (0..self.batch.num_rows()).step_by(batch_size) {
-            let offset = i * batch_size;
-            let length = min(batch_size, self.batch.num_rows() - offset);
-            let slice = self.batch.slice(offset, length);
-            writer.write(&[slice]).await?;
-        }
 
         let index_metadata = IndexMetadata {
             index_type: "PQ".to_string(),
-            metric_type: self.metric_type.to_string(),
+            distance_type: self.metric_type.to_string(),
         };
 
         let mut schema_metadata = HashMap::new();
@@ -313,9 +351,59 @@ impl ProductQuantizationStorage {
     }
 }
 
+#[async_trait]
+impl QuantizerStorage for ProductQuantizationStorage {
+    type Metadata = ProductQuantizationMetadata;
+    /// Load a partition of PQ storage from disk.
+    ///
+    /// Parameters
+    /// ----------
+    /// - *reader: &FileReader
+    async fn load_partition(
+        reader: &FileReader,
+        range: std::ops::Range<usize>,
+        metric_type: MetricType,
+        metadata: &Self::Metadata,
+    ) -> Result<Self> {
+        // Hard coded to float32 for now
+        let codebook = Arc::new(
+            metadata
+                .codebook
+                .as_ref()
+                .ok_or(Error::Index {
+                    message: "Codebook not found in PQ metadata".to_string(),
+                    location: location!(),
+                })?
+                .values()
+                .as_primitive::<Float32Type>()
+                .clone(),
+        );
+
+        let schema = reader.schema();
+        let batch = reader.read_range(range, schema, None).await?;
+
+        Self::new(
+            codebook,
+            batch,
+            metadata.num_bits,
+            metadata.num_sub_vectors,
+            metadata.dimension,
+            metric_type,
+        )
+    }
+}
+
 impl VectorStorage for ProductQuantizationStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn len(&self) -> usize {
         self.batch.num_rows()
+    }
+
+    fn row_ids(&self) -> &[u64] {
+        self.row_ids.values()
     }
 
     fn metric_type(&self) -> MetricType {
@@ -372,17 +460,13 @@ impl PQDistCalculator {
 }
 
 impl DistCalculator for PQDistCalculator {
-    fn distance(&self, ids: &[u32]) -> Vec<f32> {
-        ids.iter()
-            .map(|&id| {
-                let pq_code = self.get_pq_code(id);
-                pq_code
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &c)| self.distance_table[i * self.num_centroids + c as usize])
-                    .sum()
-            })
-            .collect()
+    fn distance(&self, id: u32) -> f32 {
+        let pq_code = self.get_pq_code(id);
+        pq_code
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| self.distance_table[i * self.num_centroids + c as usize])
+            .sum()
     }
 }
 
@@ -390,10 +474,9 @@ impl DistCalculator for PQDistCalculator {
 mod tests {
     use super::*;
 
-    use arrow_array::FixedSizeListArray;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::{datatypes::Schema, ROW_ID_FIELD};
+    use lance_core::ROW_ID_FIELD;
 
     const DIM: usize = 32;
     const TOTAL: usize = 512;
@@ -459,7 +542,7 @@ mod tests {
         .await
         .unwrap();
 
-        storage.write(&mut file_writer).await.unwrap();
+        storage.write_full(&mut file_writer).await.unwrap();
 
         let storage2 = ProductQuantizationStorage::load(&store, &path)
             .await

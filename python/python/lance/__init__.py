@@ -1,20 +1,9 @@
-#  Copyright (c) 2023. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Dict, Optional, Union
 
 from .dataset import (
     LanceDataset,
@@ -62,6 +51,7 @@ def dataset(
     block_size: Optional[int] = None,
     commit_lock: Optional[CommitLock] = None,
     index_cache_size: Optional[int] = None,
+    storage_options: Optional[Dict[str, str]] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -92,6 +82,9 @@ def dataset(
         and the row ids (``nd.array([n], dtype=uint64)``).
         Approximately, ``n = Total Rows / number of IVF partitions``.
         ``pq = number of PQ sub-vectors``.
+    storage_options : optional, dict
+        Extra options that make sense for a particular storage connection. This is
+        used to store connection parameters like credentials, endpoint, etc.
     """
     ds = LanceDataset(
         uri,
@@ -99,6 +92,7 @@ def dataset(
         block_size,
         commit_lock=commit_lock,
         index_cache_size=index_cache_size,
+        storage_options=storage_options,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)

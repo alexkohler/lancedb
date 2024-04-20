@@ -1,15 +1,5 @@
-#  Copyright 2023 Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import platform
 import random
@@ -343,6 +333,30 @@ def test_create_dot_index(dataset, tmp_path):
     assert ann_ds.has_index
 
 
+def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
+    assert not dataset.has_index
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+    )
+    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
+def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
+    assert not dataset.has_index
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_SQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+    )
+    assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
 def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     centroids = np.random.randn(5, 128).astype(np.float32)  # IVF5
     dataset_with_index = dataset.create_index(
@@ -437,10 +451,12 @@ def create_uniform_table(min, max, nvec, offset, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     # rowid = np.arange(offset, offset + nvec)
     tbl = vec_to_table(data=mat)
-    tbl = pa.Table.from_pydict({
-        "vector": tbl.column(0).chunk(0),
-        "filterable": np.arange(offset, offset + nvec),
-    })
+    tbl = pa.Table.from_pydict(
+        {
+            "vector": tbl.column(0).chunk(0),
+            "filterable": np.arange(offset, offset + nvec),
+        }
+    )
     return tbl
 
 
@@ -508,10 +524,12 @@ def test_knn_with_deletions(tmp_path):
     values = pa.array(
         [x for val in range(50) for x in [float(val)] * 5], type=pa.float32()
     )
-    tbl = pa.Table.from_pydict({
-        "vector": pa.FixedSizeListArray.from_arrays(values, dims),
-        "filterable": pa.array(range(50)),
-    })
+    tbl = pa.Table.from_pydict(
+        {
+            "vector": pa.FixedSizeListArray.from_arrays(values, dims),
+            "filterable": pa.array(range(50)),
+        }
+    )
     dataset = lance.write_dataset(tbl, tmp_path, max_rows_per_group=10)
 
     dataset.delete("not (filterable % 5 == 0)")
@@ -679,3 +697,35 @@ def test_dynamic_projection_with_vectors_index(tmp_path: Path):
     casted = np.stack(res["vec_f16"].to_numpy())
 
     assert (original.astype(np.float16) == casted).all()
+
+
+def test_index_cast_centroids(tmp_path):
+    tbl = create_table(nvec=1000)
+
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator=torch.device("cpu"),
+    )
+
+    # Get the centroids
+    index_name = dataset.list_indices()[0]["name"]
+    index_stats = dataset.stats.index_stats(index_name)
+    centroids = index_stats["indices"][0]["centroids"]
+    values = pa.array([x for arr in centroids for x in arr], pa.float32())
+    centroids = pa.FixedSizeListArray.from_arrays(values, 128)
+
+    dataset.alter_columns(dict(path="vector", data_type=pa.list_(pa.float16(), 128)))
+
+    # centroids are f32, but the column is now f16
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator=torch.device("cpu"),
+        ivf_centroids=centroids,
+    )

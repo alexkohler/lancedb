@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -43,8 +32,7 @@ use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_datafusion::exec::execute_plan;
-use lance_datafusion::expr::parse_substrait;
+use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -57,13 +45,17 @@ use tracing::{info_span, instrument, Span};
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
-use crate::io::exec::{FilterPlan, MaterializeIndexExec, PreFilterSource, ScalarIndexExec};
+use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
+use crate::io::exec::{FilterPlan, PreFilterSource};
 use crate::io::exec::{
     KNNFlatExec, KNNIndexExec, LancePushdownScanExec, LanceScanExec, Planner, ProjectionExec,
     ScanConfig, TakeExec,
 };
 use crate::{Error, Result};
 use snafu::{location, Location};
+
+#[cfg(feature = "substrait")]
+use lance_datafusion::expr::parse_substrait;
 
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
 
@@ -344,6 +336,7 @@ impl Scanner {
     ///
     /// The message must contain exactly one expression and that expression
     /// must be a scalar expression whose return type is boolean.
+    #[cfg(feature = "substrait")]
     pub async fn filter_substrait(&mut self, filter: &[u8]) -> Result<&mut Self> {
         let schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
         let expr = parse_substrait(filter, schema.clone()).await?;
@@ -474,6 +467,7 @@ impl Scanner {
             key: key.into(),
             k,
             nprobes: 1,
+            ef: None,
             refine_factor: None,
             metric_type: MetricType::L2,
             use_index: true,
@@ -484,6 +478,13 @@ impl Scanner {
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.nprobes = n;
+        }
+        self
+    }
+
+    pub fn ef(&mut self, ef: usize) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.ef = Some(ef);
         }
         self
     }
@@ -667,12 +668,18 @@ impl Scanner {
     #[instrument(skip_all)]
     pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
         let plan = self.create_plan().await?;
-        Ok(DatasetRecordBatchStream::new(execute_plan(plan)?))
+        Ok(DatasetRecordBatchStream::new(execute_plan(
+            plan,
+            LanceExecutionOptions::default(),
+        )?))
     }
 
-    pub(crate) async fn try_into_dfstream(&self) -> Result<SendableRecordBatchStream> {
+    pub(crate) async fn try_into_dfstream(
+        &self,
+        options: LanceExecutionOptions,
+    ) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
-        execute_plan(plan)
+        execute_plan(plan, options)
     }
 
     pub async fn try_into_batch(&self) -> Result<RecordBatch> {
@@ -705,7 +712,7 @@ impl Scanner {
             plan,
             plan_schema,
         )?);
-        let mut stream = execute_plan(count_plan)?;
+        let mut stream = execute_plan(count_plan, LanceExecutionOptions::default())?;
 
         // A count plan will always return a single batch with a single row.
         if let Some(first_batch) = stream.next().await {
@@ -1480,13 +1487,152 @@ impl From<DatasetRecordBatchStream> for SendableRecordBatchStream {
 }
 
 #[cfg(test)]
+pub mod test_dataset {
+
+    use super::*;
+
+    use std::vec;
+
+    use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
+    use arrow_schema::ArrowError;
+    use lance_index::IndexType;
+    use tempfile::{tempdir, TempDir};
+
+    use crate::arrow::*;
+    use crate::dataset::WriteParams;
+    use crate::index::scalar::ScalarIndexParams;
+    use crate::index::vector::VectorIndexParams;
+
+    // Creates a dataset with 5 batches where each batch has 80 rows
+    //
+    // The dataset has the following columns:
+    //
+    //  i   - i32      : [0, 1, ..., 399]
+    //  s   - &str     : ["s-0", "s-1", ..., "s-399"]
+    //  vec - [f32; 32]: [[0, 1, ... 31], [32, ..., 63], ... [..., (80 * 5 * 32) - 1]]
+    //
+    // An IVF-PQ index with 2 partitions is trained on this data
+    pub struct TestVectorDataset {
+        pub tmp_dir: TempDir,
+        pub schema: Arc<ArrowSchema>,
+        pub dataset: Dataset,
+    }
+
+    impl TestVectorDataset {
+        pub async fn new() -> Result<Self> {
+            let tmp_dir = tempdir()?;
+            let path = tmp_dir.path().to_str().unwrap();
+
+            // Make sure the schema has metadata so it tests all paths that re-construct the schema along the way
+            let metadata: HashMap<String, String> =
+                vec![("dataset".to_string(), "vector".to_string())]
+                    .into_iter()
+                    .collect();
+
+            let schema = Arc::new(ArrowSchema::new_with_metadata(
+                vec![
+                    ArrowField::new("i", DataType::Int32, true),
+                    ArrowField::new("s", DataType::Utf8, true),
+                    ArrowField::new(
+                        "vec",
+                        DataType::FixedSizeList(
+                            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                            32,
+                        ),
+                        true,
+                    ),
+                ],
+                metadata,
+            ));
+
+            let batches: Vec<RecordBatch> = (0..5)
+                .map(|i| {
+                    let vector_values: Float32Array = (0..32 * 80).map(|v| v as f32).collect();
+                    let vectors =
+                        FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from_iter_values(i * 80..(i + 1) * 80)),
+                            Arc::new(StringArray::from_iter_values(
+                                (i * 80..(i + 1) * 80).map(|v| format!("s-{}", v)),
+                            )),
+                            Arc::new(vectors),
+                        ],
+                    )
+                })
+                .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
+
+            let params = WriteParams {
+                max_rows_per_group: 10,
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+            let dataset = Dataset::write(reader, path, Some(params)).await?;
+
+            Ok(Self {
+                tmp_dir,
+                schema,
+                dataset,
+            })
+        }
+
+        pub async fn make_vector_index(&mut self) -> Result<()> {
+            let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
+            self.dataset
+                .create_index(
+                    &["vec"],
+                    IndexType::Vector,
+                    Some("idx".to_string()),
+                    &params,
+                    true,
+                )
+                .await
+        }
+
+        pub async fn make_scalar_index(&mut self) -> Result<()> {
+            self.dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+        }
+
+        pub async fn append_new_data(&mut self) -> Result<()> {
+            let vector_values: Float32Array =
+                (0..10).flat_map(|i| [i as f32; 32].into_iter()).collect();
+            let new_vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
+            let new_data: Vec<ArrayRef> = vec![
+                Arc::new(Int32Array::from_iter_values(400..410)), // 5 * 80
+                Arc::new(StringArray::from_iter_values(
+                    (400..410).map(|v| format!("s-{}", v)),
+                )),
+                Arc::new(new_vectors),
+            ];
+            let reader = RecordBatchIterator::new(
+                vec![RecordBatch::try_new(self.schema.clone(), new_data).unwrap()]
+                    .into_iter()
+                    .map(Ok),
+                self.schema.clone(),
+            );
+            self.dataset.append(reader, None).await?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
 mod test {
 
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::BTreeSet;
     use std::vec;
 
     use arrow::array::as_primitive_array;
-    use arrow::compute::concat_batches;
     use arrow::datatypes::Int32Type;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
@@ -1495,20 +1641,18 @@ mod test {
         RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::{ArrowError, DataType};
     use arrow_select::take;
     use datafusion::logical_expr::{col, lit};
-    use futures::TryStreamExt;
     use half::f16;
-    use lance_core::ROW_ID;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
-    use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
+    use lance_index::IndexType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use tempfile::{tempdir, TempDir};
 
     use super::*;
     use crate::arrow::*;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
+    use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
     use crate::index::scalar::ScalarIndexParams;
@@ -1611,128 +1755,6 @@ mod test {
 
         assert_eq!(actual, full_data);
         Ok(())
-    }
-
-    // Creates a dataset with 5 batches where each batch has 80 rows
-    //
-    // The dataset has the following columns:
-    //
-    //  i   - i32      : [0, 1, ..., 399]
-    //  s   - &str     : ["s-0", "s-1", ..., "s-399"]
-    //  vec - [f32; 32]: [[0, 1, ... 31], [32, ..., 63], ... [..., (80 * 5 * 32) - 1]]
-    //
-    // An IVF-PQ index with 2 partitions is trained on this data
-    struct TestVectorDataset {
-        _tmp_dir: TempDir,
-        pub schema: Arc<ArrowSchema>,
-        pub dataset: Dataset,
-    }
-
-    impl TestVectorDataset {
-        async fn new() -> Result<Self> {
-            let tmp_dir = tempdir()?;
-            let path = tmp_dir.path().to_str().unwrap();
-
-            // Make sure the schema has metadata so it tests all paths that re-construct the schema along the way
-            let metadata: HashMap<String, String> =
-                vec![("dataset".to_string(), "vector".to_string())]
-                    .into_iter()
-                    .collect();
-
-            let schema = Arc::new(ArrowSchema::new_with_metadata(
-                vec![
-                    ArrowField::new("i", DataType::Int32, true),
-                    ArrowField::new("s", DataType::Utf8, true),
-                    ArrowField::new(
-                        "vec",
-                        DataType::FixedSizeList(
-                            Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                            32,
-                        ),
-                        true,
-                    ),
-                ],
-                metadata,
-            ));
-
-            let batches: Vec<RecordBatch> = (0..5)
-                .map(|i| {
-                    let vector_values: Float32Array = (0..32 * 80).map(|v| v as f32).collect();
-                    let vectors =
-                        FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![
-                            Arc::new(Int32Array::from_iter_values(i * 80..(i + 1) * 80)),
-                            Arc::new(StringArray::from_iter_values(
-                                (i * 80..(i + 1) * 80).map(|v| format!("s-{}", v)),
-                            )),
-                            Arc::new(vectors),
-                        ],
-                    )
-                })
-                .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
-
-            let params = WriteParams {
-                max_rows_per_group: 10,
-                ..Default::default()
-            };
-            let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-
-            let dataset = Dataset::write(reader, path, Some(params)).await?;
-
-            Ok(Self {
-                _tmp_dir: tmp_dir,
-                schema,
-                dataset,
-            })
-        }
-
-        async fn make_vector_index(&mut self) -> Result<()> {
-            let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
-            self.dataset
-                .create_index(
-                    &["vec"],
-                    IndexType::Vector,
-                    Some("idx".to_string()),
-                    &params,
-                    true,
-                )
-                .await
-        }
-
-        async fn make_scalar_index(&mut self) -> Result<()> {
-            self.dataset
-                .create_index(
-                    &["i"],
-                    IndexType::Scalar,
-                    None,
-                    &ScalarIndexParams::default(),
-                    true,
-                )
-                .await
-        }
-
-        async fn append_new_data(&mut self) -> Result<()> {
-            let vector_values: Float32Array =
-                (0..10).flat_map(|i| [i as f32; 32].into_iter()).collect();
-            let new_vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
-            let new_data: Vec<ArrayRef> = vec![
-                Arc::new(Int32Array::from_iter_values(400..410)), // 5 * 80
-                Arc::new(StringArray::from_iter_values(
-                    (400..410).map(|v| format!("s-{}", v)),
-                )),
-                Arc::new(new_vectors),
-            ];
-            let reader = RecordBatchIterator::new(
-                vec![RecordBatch::try_new(self.schema.clone(), new_data).unwrap()]
-                    .into_iter()
-                    .map(Ok),
-                self.schema.clone(),
-            );
-            self.dataset.append(reader, None).await?;
-            Ok(())
-        }
     }
 
     #[tokio::test]

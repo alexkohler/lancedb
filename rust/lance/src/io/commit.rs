@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Trait for commit implementations.
 //!
@@ -33,9 +22,10 @@
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler
 //! alternative to [CommitHandler].
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use lance_table::format::{pb, DeletionFile, Fragment, Index, Manifest};
+use lance_table::format::{pb, DeletionFile, Fragment, Index, Manifest, WriterVersion};
 use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler};
 use lance_table::io::deletion::read_deletion_file;
 use snafu::{location, Location};
@@ -150,6 +140,28 @@ pub(crate) async fn commit_new_dataset(
     Ok(manifest)
 }
 
+/// Internal function to check if a manifest could use some migration.
+///
+/// Manifest migrations happen on each write, but sometimes we need to run them
+/// before certain new operations. An easy way to force a migration is to run
+/// `dataset.delete(false)`, which won't modify data but will cause a migration.
+/// However, you don't want to always have to do this, so we provide this method
+/// to check if a migration is needed.
+pub fn manifest_needs_migration(manifest: &Manifest, indices: &[Index]) -> bool {
+    manifest.writer_version.is_none()
+        || manifest.fragments.iter().any(|f| {
+            f.physical_rows.is_none()
+                || (f
+                    .deletion_file
+                    .as_ref()
+                    .map(|d| d.num_deleted_rows.is_none())
+                    .unwrap_or(false))
+        })
+        || indices
+            .iter()
+            .any(|i| must_recalculate_fragment_bitmap(i, manifest.writer_version.as_ref()))
+}
+
 /// Update manifest with new metadata fields.
 ///
 /// Fields such as `physical_rows` and `num_deleted_rows` may not have been
@@ -174,6 +186,88 @@ async fn migrate_manifest(
 
     manifest.fragments =
         Arc::new(migrate_fragments(dataset, &manifest.fragments, recompute_stats).await?);
+
+    Ok(())
+}
+
+/// Fix schema in case of duplicate field ids.
+///
+/// See test dataset v0.10.5/corrupt_schema
+fn fix_schema(manifest: &mut Manifest) -> Result<()> {
+    // We can short-circuit if there is only one file per fragment or no fragments.
+    if manifest.fragments.iter().all(|f| f.files.len() <= 1) {
+        return Ok(());
+    }
+
+    // First, see which, if any fields have duplicate ids, within any fragment.
+    let mut fields_with_duplicate_ids = HashSet::new();
+    let mut seen_fields = HashSet::new();
+    for fragment in manifest.fragments.iter() {
+        for file in fragment.files.iter() {
+            for field_id in file.fields.iter() {
+                if !seen_fields.insert(*field_id) {
+                    fields_with_duplicate_ids.insert(*field_id);
+                }
+            }
+        }
+        seen_fields.clear();
+    }
+    if fields_with_duplicate_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Now, we need to remap the field ids to be unique.
+    let mut field_id_seed = manifest.max_field_id() + 1;
+    let mut old_field_id_mapping: HashMap<i32, i32> = HashMap::new();
+    let mut fields_with_duplicate_ids = fields_with_duplicate_ids.into_iter().collect::<Vec<_>>();
+    fields_with_duplicate_ids.sort_unstable();
+    for field_id in fields_with_duplicate_ids {
+        old_field_id_mapping.insert(field_id, field_id_seed);
+        field_id_seed += 1;
+    }
+
+    let mut fragments = manifest.fragments.as_ref().clone();
+
+    // Apply mapping to fragment files list
+    // We iterate over files in reverse order so that we only map the last field id
+    seen_fields.clear();
+    for fragment in fragments.iter_mut() {
+        for field_id in fragment
+            .files
+            .iter_mut()
+            .rev()
+            .flat_map(|file| file.fields.iter_mut())
+        {
+            if let Some(new_field_id) = old_field_id_mapping.get(field_id) {
+                if seen_fields.insert(*field_id) {
+                    *field_id = *new_field_id;
+                }
+            }
+        }
+        seen_fields.clear();
+    }
+
+    // Apply mapping to the schema
+    for (old_field_id, new_field_id) in &old_field_id_mapping {
+        let field = manifest.schema.mut_field_by_id(*old_field_id).unwrap();
+        field.id = *new_field_id;
+    }
+
+    // Drop data files that are no longer in use.
+    let remaining_field_ids = manifest
+        .schema
+        .fields_pre_order()
+        .map(|f| f.id)
+        .collect::<HashSet<_>>();
+    for fragment in fragments.iter_mut() {
+        fragment.files.retain(|file| {
+            file.fields
+                .iter()
+                .any(|field_id| remaining_field_ids.contains(field_id))
+        });
+    }
+
+    manifest.fragments = Arc::new(fragments);
 
     Ok(())
 }
@@ -242,22 +336,18 @@ pub(crate) async fn migrate_fragments(
     new_fragments.try_collect().await
 }
 
+fn must_recalculate_fragment_bitmap(index: &Index, version: Option<&WriterVersion>) -> bool {
+    // If the fragment bitmap was written by an old version of lance then we need to recalculate
+    // it because it could be corrupt due to a bug in versions < 0.8.15
+    index.fragment_bitmap.is_none() || version.map(|v| v.older_than(0, 8, 15)).unwrap_or(true)
+}
+
 /// Update indices with new fields.
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()> {
     for index in indices {
-        // If the fragment bitmap is missing we need to recalculate it
-        let mut must_recalculate_fragment_bitmap = index.fragment_bitmap.is_none();
-        // If the fragment bitmap was written by an old version of lance then we need to recalculate
-        // it because it could be corrupt due to a bug in versions < 0.8.15
-        must_recalculate_fragment_bitmap |=
-            if let Some(writer_version) = &dataset.manifest.writer_version {
-                writer_version.older_than(0, 8, 15)
-            } else {
-                true
-            };
-        if must_recalculate_fragment_bitmap {
+        if must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref()) {
             debug_assert_eq!(index.fields.len(), 1);
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
             // We need to calculate the fragments covered by the index
@@ -343,12 +433,14 @@ pub(crate) async fn commit_transaction(
 
         let previous_writer_version = &dataset.manifest.writer_version;
         // The versions of Lance prior to when we started writing the writer version
-        // sometimes wrote incorrect `Fragment.phyiscal_rows` values, so we should
+        // sometimes wrote incorrect `Fragment.physical_rows` values, so we should
         // make sure to recompute them.
         // See: https://github.com/lancedb/lance/issues/1531
         let recompute_stats = previous_writer_version.is_none();
 
         migrate_manifest(&dataset, &mut manifest, recompute_stats).await?;
+
+        fix_schema(&mut manifest)?;
 
         migrate_indices(&dataset, &mut indices).await?;
 
@@ -404,15 +496,16 @@ pub(crate) async fn commit_transaction(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_core::datatypes::{Field, Schema};
+    use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
+    use lance_table::format::DataFile;
     use lance_table::io::commit::{
         CommitLease, CommitLock, RenameCommitHandler, UnsafeCommitHandler,
     };
@@ -420,13 +513,12 @@ mod tests {
 
     use super::*;
 
-    use crate::dataset::{transaction::Operation, WriteMode, WriteParams};
+    use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
-    use crate::Dataset;
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "x",
             DataType::Int64,
             false,
@@ -585,18 +677,18 @@ mod tests {
 
         let dimension = 16;
         let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new(
+            ArrowField::new(
                 "vector1",
                 DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
                     dimension,
                 ),
                 false,
             ),
-            Field::new(
+            ArrowField::new(
                 "vector2",
                 DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
                     dimension,
                 ),
                 false,
@@ -676,7 +768,7 @@ mod tests {
             let test_dir = tempfile::tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
 
-            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "i",
                 DataType::Int32,
                 false,
@@ -739,5 +831,77 @@ mod tests {
 
             dataset.validate().await.unwrap()
         }
+    }
+
+    #[test]
+    fn test_fix_schema() {
+        // Manifest has a fragment with no fields in use
+        // Manifest has a duplicate field id in one fragment but not others.
+        let mut field0 =
+            Field::try_from(ArrowField::new("a", arrow_schema::DataType::Int64, false)).unwrap();
+        field0.set_id(-1, &mut 0);
+        let mut field2 =
+            Field::try_from(ArrowField::new("b", arrow_schema::DataType::Int64, false)).unwrap();
+        field2.set_id(-1, &mut 2);
+
+        let schema = Schema {
+            fields: vec![field0.clone(), field2.clone()],
+            metadata: Default::default(),
+        };
+        let fragments = vec![
+            Fragment {
+                id: 0,
+                files: vec![
+                    DataFile::new_legacy_from_fields("path1", vec![0, 1, 2]),
+                    DataFile::new_legacy_from_fields("unused", vec![9]),
+                ],
+                deletion_file: None,
+                physical_rows: None,
+            },
+            Fragment {
+                id: 1,
+                files: vec![
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2]),
+                    DataFile::new_legacy_from_fields("path3", vec![2]),
+                ],
+                deletion_file: None,
+                physical_rows: None,
+            },
+        ];
+
+        let mut manifest = Manifest::new(schema, Arc::new(fragments));
+
+        fix_schema(&mut manifest).unwrap();
+
+        // Because of the duplicate field id, the field id of field2 should have been changed to 10
+        field2.id = 10;
+        let expected_schema = Schema {
+            fields: vec![field0, field2],
+            metadata: Default::default(),
+        };
+        assert_eq!(manifest.schema, expected_schema);
+
+        // The fragment with just field 9 should have been removed, since it's
+        // not used in the current schema.
+        // The field 2 should have been changed to 10, except in the first
+        // file of the second fragment.
+        let expected_fragments = vec![
+            Fragment {
+                id: 0,
+                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 10])],
+                deletion_file: None,
+                physical_rows: None,
+            },
+            Fragment {
+                id: 1,
+                files: vec![
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 2]),
+                    DataFile::new_legacy_from_fields("path3", vec![10]),
+                ],
+                deletion_file: None,
+                physical_rows: None,
+            },
+        ];
+        assert_eq!(manifest.fragments.as_ref(), &expected_fragments);
     }
 }

@@ -1,23 +1,12 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Testing utilities
 
 use crate::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Duration;
+use chrono::{Duration, TimeDelta};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
@@ -86,7 +75,7 @@ impl ProxyObjectStorePolicy {
     }
 
     pub fn clear_before_policy(&mut self, name: &str) {
-        self.before_policies.remove(&name.to_string());
+        self.before_policies.remove(name);
     }
 
     pub fn set_obj_meta_policy(&mut self, name: &str, policy: ObjectMetaPolicyFn) {
@@ -252,6 +241,6 @@ impl<'a> MockClock<'a> {
 impl<'a> Drop for MockClock<'a> {
     fn drop(&mut self) {
         // Reset the clock to the epoch
-        mock_instant::MockClock::set_system_time(Duration::days(0).to_std().unwrap());
+        mock_instant::MockClock::set_system_time(TimeDelta::try_days(0).unwrap().to_std().unwrap());
     }
 }

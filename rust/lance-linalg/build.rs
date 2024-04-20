@@ -1,21 +1,15 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::env;
 
-fn main() {
-    let rust_toolchain = env::var("RUSTUP_TOOLCHAIN").unwrap();
+fn main() -> Result<(), String> {
+    let rust_toolchain = env::var("RUSTUP_TOOLCHAIN")
+        .or_else(|e| match e {
+            env::VarError::NotPresent => Ok("stable".into()),
+            e => Err(e),
+        })
+        .unwrap();
     if rust_toolchain.starts_with("nightly") {
         // enable the 'nightly' feature flag
         println!("cargo:rustc-cfg=feature=\"nightly\"");
@@ -23,10 +17,17 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
 
-    if cfg!(any(not(feature = "fp16kernels"), target_os = "windows")) {
-        // We only compile the f16 kernels if the feature is enabled
-        // MSVC does not support the f16 type, so we also skip it on Windows.
-        return;
+    if cfg!(not(feature = "fp16kernels")) {
+        println!(
+            "cargo:warning=fp16kernels feature is not enabled, skipping build of fp16 kernels"
+        );
+        return Ok(());
+    }
+
+    if cfg!(target_os = "windows") {
+        return Err(
+            "cargo:warning=fp16 kernels are not supported on Windows.  Please remove fp16kernels feature".to_string()
+        );
     }
 
     if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
@@ -35,15 +36,16 @@ fn main() {
     } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-march=armv8.2-a+fp16"]).unwrap();
-    }
-
-    if cfg!(target_arch = "x86_64") {
+    } else if cfg!(target_arch = "x86_64") {
         // Build a version with AVX512
         if let Err(err) = build_f16_with_flags("avx512", &["-march=sapphirerapids", "-mavx512fp16"])
         {
             // It's likely the compiler doesn't support the sapphirerapids architecture
             // Clang 12 and GCC 11 are the first versions with sapphire rapids support
-            eprintln!("Skipping Sapphire Rapids build due to error: {}", err);
+            println!(
+                "cargo:warning=Skipping build of AVX-512 fp16 kernels.  Clang/GCC too old or compiler does not support sapphirerapids architecture.  Error: {}",
+                err
+            );
         } else {
             // We create a special cfg so that we can detect we have in fact
             // generated the AVX512 version of the f16 kernels.
@@ -53,9 +55,14 @@ fn main() {
         // While GCC doesn't have support for _Float16 until GCC 12, clang
         // has support for __fp16 going back to at least clang 6.
         // We use haswell since it's the oldest CPUs on AWS.
-        build_f16_with_flags("avx2", &["-march=haswell"]).unwrap();
+        if let Err(err) = build_f16_with_flags("avx2", &["-march=haswell"]) {
+            return Err(format!("Unable to build AVX2 f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature.  Received error: {}", err));
+        };
         // There is no SSE instruction set for f16 -> f32 float conversion
+    } else {
+        return Err("Unable to build f16 kernels on given target_arch.  Please use x86_64 or aarch64 or remove the fp16kernels feature".to_string());
     }
+    Ok(())
 }
 
 fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {

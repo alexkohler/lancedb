@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
@@ -271,7 +260,9 @@ impl FragmentScanner {
         }
 
         // We only need the statistics for the predicate projection.
-        let stats = reader.read_page_stats(Some(&predicate_projection)).await?;
+        let stats = reader
+            .legacy_read_page_stats(Some(&predicate_projection))
+            .await?;
 
         Ok(Self {
             fragment,
@@ -337,7 +328,7 @@ impl FragmentScanner {
                     projection_reader.with_row_id();
                 }
                 let batch = projection_reader
-                    .read_batch_projected(batch_id, .., &self.projection)
+                    .legacy_read_batch_projected(batch_id, .., &self.projection)
                     .await?;
                 let batch = self.final_projection(batch)?;
                 Ok(Some(batch))
@@ -368,7 +359,7 @@ impl FragmentScanner {
                 reader.with_row_id();
 
                 let batch = reader
-                    .read_batch_projected(batch_id, .., &predicate_projection)
+                    .legacy_read_batch_projected(batch_id, .., &predicate_projection)
                     .await?;
 
                 // 2. Evaluate predicate
@@ -441,7 +432,7 @@ impl FragmentScanner {
                     let remaining_projection = self.projection.project_by_ids(&remaining_fields);
                     Some(
                         self.reader
-                            .read_batch_projected(
+                            .legacy_read_batch_projected(
                                 batch_id,
                                 selection.clone(),
                                 &remaining_projection,
@@ -614,11 +605,11 @@ impl FragmentScanner {
     }
 
     fn simplified_predicates(&self) -> Result<Vec<Expr>> {
-        let num_batches = self.reader.num_batches();
+        let num_batches = self.reader.legacy_num_batches();
 
         if let Some(stats) = &self.stats {
             let batch_sizes: Vec<usize> = (0..num_batches)
-                .map(|batch_id| self.reader.num_rows_in_batch(batch_id))
+                .map(|batch_id| self.reader.legacy_num_rows_in_batch(batch_id))
                 .collect();
             let schema =
                 Arc::new(ArrowSchema::from(self.predicate_projection.as_ref()).try_into()?);
@@ -653,14 +644,14 @@ impl FragmentScanner {
 #[cfg(test)]
 mod test {
     use arrow_array::{
-        types::{Float32Type, Int32Type, UInt64Type},
+        types::{Float32Type, Int32Type},
         ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array,
         RecordBatchIterator, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::TimeUnit;
     use arrow_select::concat::concat_batches;
-    use datafusion::prelude::{col, lit, Column, SessionContext};
+    use datafusion::prelude::{lit, Column, SessionContext};
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use tempfile::tempdir;
 

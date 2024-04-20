@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Floats Array
 
@@ -95,6 +84,8 @@ pub trait ArrowFloatType: Debug {
         + Display;
 
     const FLOAT_TYPE: FloatType;
+    const MIN: Self::Native;
+    const MAX: Self::Native;
 
     /// Arrow Float Array Type.
     type ArrayType: FloatArray<Self>;
@@ -140,6 +131,8 @@ impl ArrowFloatType for BFloat16Type {
     type Native = bf16;
 
     const FLOAT_TYPE: FloatType = FloatType::BFloat16;
+    const MIN: Self::Native = bf16::MIN;
+    const MAX: Self::Native = bf16::MAX;
 
     type ArrayType = BFloat16Array;
 }
@@ -148,6 +141,8 @@ impl ArrowFloatType for Float16Type {
     type Native = f16;
 
     const FLOAT_TYPE: FloatType = FloatType::Float16;
+    const MIN: Self::Native = f16::MIN;
+    const MAX: Self::Native = f16::MAX;
 
     type ArrayType = Float16Array;
 }
@@ -156,6 +151,8 @@ impl ArrowFloatType for Float32Type {
     type Native = f32;
 
     const FLOAT_TYPE: FloatType = FloatType::Float32;
+    const MIN: Self::Native = f32::MIN;
+    const MAX: Self::Native = f32::MAX;
 
     type ArrayType = Float32Array;
 }
@@ -164,6 +161,8 @@ impl ArrowFloatType for Float64Type {
     type Native = f64;
 
     const FLOAT_TYPE: FloatType = FloatType::Float64;
+    const MIN: Self::Native = f64::MIN;
+    const MAX: Self::Native = f64::MAX;
 
     type ArrayType = Float64Array;
 }

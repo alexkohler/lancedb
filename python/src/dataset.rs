@@ -12,19 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::str;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::{ToPyArrow, *};
+use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use chrono::Duration;
 
+use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::transaction::validate_operation;
 use lance::dataset::ColumnAlteration;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
@@ -38,6 +41,8 @@ use lance::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     DatasetIndexExt, IndexParams, IndexType,
@@ -59,6 +64,7 @@ use pyo3::{
 use snafu::{location, Location};
 
 use crate::fragment::{FileFragment, FragmentMetadata};
+use crate::schema::LanceSchema;
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
@@ -85,6 +91,7 @@ fn into_fragments(fragments: Vec<FragmentMetadata>) -> Vec<Fragment> {
 }
 
 fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
+    // Note: the field ids here are wrong.
     Schema::try_from(arrow_schema).map_err(|e| {
         PyValueError::new_err(format!(
             "Failed to convert Arrow schema to Lance schema: {}",
@@ -238,8 +245,8 @@ impl Operation {
     }
 
     #[staticmethod]
-    fn merge(fragments: Vec<FragmentMetadata>, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        let schema = convert_schema(&schema.0)?;
+    fn merge(fragments: Vec<FragmentMetadata>, schema: LanceSchema) -> PyResult<Self> {
+        let schema = schema.0;
         let fragments = into_fragments(fragments);
         let op = LanceOperation::Merge { fragments, schema };
         Ok(Self(op))
@@ -258,7 +265,7 @@ impl Operation {
 pub struct Dataset {
     #[pyo3(get)]
     uri: String,
-    ds: Arc<LanceDataset>,
+    pub(crate) ds: Arc<LanceDataset>,
 }
 
 #[pymethods]
@@ -271,6 +278,7 @@ impl Dataset {
         index_cache_size: Option<usize>,
         metadata_cache_size: Option<usize>,
         commit_handler: Option<PyObject>,
+        storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams {
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
@@ -286,29 +294,40 @@ impl Dataset {
             let py_commit_lock = PyCommitLock::new(commit_handler);
             params.set_commit_lock(Arc::new(py_commit_lock));
         }
-        let dataset = if let Some(ver) = version {
-            RT.runtime
-                .block_on(LanceDataset::checkout_with_params(&uri, ver, &params))
-        } else {
-            RT.runtime.block_on(
-                DatasetBuilder::from_uri(&uri)
-                    .with_read_params(params)
-                    .load(),
-            )
-        };
+
+        let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
+        if let Some(ver) = version {
+            builder = builder.with_version(ver);
+        }
+        if let Some(storage_options) = storage_options {
+            builder = builder.with_storage_options(storage_options);
+        }
+
+        let dataset = RT.runtime.block_on(builder.load());
+
         match dataset {
             Ok(ds) => Ok(Self {
                 uri,
                 ds: Arc::new(ds),
             }),
+            // TODO: return an appropriate error type, such as IOError or NotFound.
             Err(err) => Err(PyValueError::new_err(err.to_string())),
         }
+    }
+
+    pub fn __copy__(&self) -> Self {
+        self.clone()
     }
 
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let arrow_schema = ArrowSchema::from(self_.ds.schema());
         arrow_schema.to_pyarrow(self_.py())
+    }
+
+    #[getter(lance_schema)]
+    fn lance_schema(self_: PyRef<'_, Self>) -> LanceSchema {
+        LanceSchema(self_.ds.schema().clone())
     }
 
     /// Get index statistics
@@ -557,9 +576,9 @@ impl Dataset {
         Ok(Scanner::new(scan))
     }
 
-    fn count_rows(&self) -> PyResult<usize> {
+    fn count_rows(&self, filter: Option<String>) -> PyResult<usize> {
         RT.runtime
-            .block_on(self.ds.count_rows())
+            .block_on(self.ds.count_rows(filter))
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
@@ -578,7 +597,7 @@ impl Dataset {
             .block_on(Some(self_.py()), self_.ds.take(&row_indices, &projection))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
-        crate::arrow::record_batch_to_pyarrow(self_.py(), &batch)
+        batch.to_pyarrow(self_.py())
     }
 
     fn take_rows(
@@ -605,7 +624,7 @@ impl Dataset {
             )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
-        crate::arrow::record_batch_to_pyarrow(self_.py(), &batch)
+        batch.to_pyarrow(self_.py())
     }
 
     #[pyo3(signature = (row_slices, columns = None, batch_readahead = 10))]
@@ -810,7 +829,10 @@ impl Dataset {
     fn checkout_version(&self, version: u64) -> PyResult<Self> {
         let ds = RT
             .block_on(None, self.ds.checkout_version(version))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err| match err {
+                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
         Ok(Self {
             ds: Arc::new(ds),
             uri: self.uri.clone(),
@@ -873,9 +895,10 @@ impl Dataset {
         replace: Option<bool>,
         kwargs: Option<&PyDict>,
     ) -> PyResult<()> {
-        let idx_type = match index_type.to_uppercase().as_str() {
+        let index_type = index_type.to_uppercase();
+        let idx_type = match index_type.as_str() {
             "BTREE" => IndexType::Scalar,
-            "IVF_PQ" => IndexType::Vector,
+            "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -884,104 +907,14 @@ impl Dataset {
         };
 
         // Only VectorParams are supported.
-        let params: Box<dyn IndexParams> = match index_type.to_uppercase().as_str() {
-            "BTREE" => Box::<ScalarIndexParams>::default(),
-            "IVF_PQ" => {
-                let mut ivf_params = IvfBuildParams::default();
-                let mut pq_params = PQBuildParams::default();
-                let mut m_type = MetricType::L2;
-                if let Some(kwargs) = kwargs {
-                    if let Some(mt) = kwargs.get_item("metric_type")? {
-                        m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
-                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-                    }
-
-                    if let Some(n) = kwargs.get_item("num_partitions")? {
-                        ivf_params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
-                    };
-
-                    if let Some(n) = kwargs.get_item("num_bits")? {
-                        pq_params.num_bits = PyAny::downcast::<PyInt>(n)?.extract()?
-                    };
-
-                    if let Some(n) = kwargs.get_item("num_sub_vectors")? {
-                        pq_params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
-                    };
-
-                    if let Some(o) = kwargs.get_item("use_opq")? {
-                        #[cfg(not(feature = "opq"))]
-                        if PyAny::downcast::<PyBool>(o)?.extract()? {
-                            return Err(PyValueError::new_err(
-                                "Feature 'opq' is not installed.".to_string(),
-                            ));
-                        }
-                        pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
-                    };
-
-                    if let Some(c) = kwargs.get_item("pq_codebook")? {
-                        let batch = RecordBatch::from_pyarrow(c)?;
-                        if "_pq_codebook" != batch.schema().field(0).name() {
-                            return Err(PyValueError::new_err(
-                                "Expected '_pq_codebook' as the first column name.",
-                            ));
-                        }
-                        let codebook = as_fixed_size_list_array(batch.column(0));
-                        pq_params.codebook = Some(codebook.values().clone())
-                    };
-
-                    if let Some(o) = kwargs.get_item("max_opq_iterations")? {
-                        pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
-                    };
-
-                    if let Some(c) = kwargs.get_item("ivf_centroids")? {
-                        let batch = RecordBatch::from_pyarrow(c)?;
-                        if "_ivf_centroids" != batch.schema().field(0).name() {
-                            return Err(PyValueError::new_err(
-                                "Expected '_ivf_centroids' as the first column name.",
-                            ));
-                        }
-                        let centroids = as_fixed_size_list_array(batch.column(0));
-                        ivf_params.centroids = Some(Arc::new(centroids.clone()))
-                    };
-
-                    if let Some(f) = kwargs.get_item("precomputed_partitions_file")? {
-                        ivf_params.precomputed_partitons_file = Some(f.to_string());
-                    };
-
-                    match (
-                        kwargs.get_item("precomputed_shuffle_buffers")?,
-                        kwargs.get_item("precomputed_shuffle_buffers_path")?
-                    ) {
-                        (Some(l), Some(p)) => {
-                            let path = Path::parse(p.to_string()).map_err(|e| {
-                                PyValueError::new_err(format!(
-                                    "Failed to parse precomputed_shuffle_buffers_path: {}",
-                                    e
-                                ))
-                            })?;
-                            let list = PyAny::downcast::<PyList>(l)?
-                                .iter()
-                                .map(|f| f.to_string())
-                                .collect();
-                            ivf_params.precomputed_shuffle_buffers = Some((path, list));
-                        },
-                        (None, None) => {},
-                        _ => {
-                            return Err(PyValueError::new_err(
-                                "precomputed_shuffle_buffers and precomputed_shuffle_buffers_path must be specified together."
-                            ))
-                        }
-                    }
-                }
-                Box::new(VectorIndexParams::with_ivf_pq_params(
-                    m_type, ivf_params, pq_params,
-                ))
-            }
-            _ => {
-                return Err(PyValueError::new_err(format!(
-                    "Index type '{index_type}' is not supported."
-                )))
-            }
+        let params: Box<dyn IndexParams> = if index_type == "BTREE" {
+            Box::<ScalarIndexParams>::default()
+        } else {
+            let column_type = match self.ds.schema().field(columns[0]) {
+                Some(f) => f.data_type().clone(),
+                None => return Err(PyValueError::new_err("Column not found in dataset schema.")),
+            };
+            prepare_vector_index_params(&index_type, &column_type, kwargs)?
         };
 
         let replace = replace.unwrap_or(true);
@@ -1046,10 +979,17 @@ impl Dataset {
                 as Arc<dyn CommitHandler>
         });
         let ds = RT
-            .block_on(
-                commit_lock.map(|cl| cl.py()),
-                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler),
-            )?
+            .block_on(commit_lock.map(|cl| cl.py()), async move {
+                let dataset = match DatasetBuilder::from_uri(dataset_uri).load().await {
+                    Ok(ds) => Some(ds),
+                    Err(lance::Error::DatasetNotFound { .. }) => None,
+                    Err(err) => return Err(err),
+                };
+                let manifest = dataset.as_ref().map(|ds| ds.manifest());
+                validate_operation(manifest, &operation.0)?;
+                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler)
+                    .await
+            })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
             ds: Arc::new(ds),
@@ -1146,24 +1086,26 @@ impl Dataset {
 }
 
 #[pyfunction(name = "_write_dataset")]
-pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<bool> {
+pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<Dataset> {
     let params = get_write_params(options)?;
     let py = options.py();
-    if reader.is_instance_of::<Scanner>() {
+    let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
         let batches = RT
             .block_on(Some(py), scanner.to_reader())?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(true)
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
         RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(true)
-    }
+            .map_err(|err| PyIOError::new_err(err.to_string()))?
+    };
+    Ok(Dataset {
+        uri,
+        ds: Arc::new(ds),
+    })
 }
 
 fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
@@ -1204,9 +1146,22 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         if let Some(maybe_nbytes) = options.get_item("max_bytes_per_file")? {
             p.max_bytes_per_file = usize::extract(maybe_nbytes)?;
         }
+        if let Some(use_experimental_writer) = options.get_item("use_experimental_writer")? {
+            p.use_experimental_writer = use_experimental_writer.extract()?;
+        }
         if let Some(progress) = options.get_item("progress")? {
             if !progress.is_none() {
                 p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));
+            }
+        }
+
+        if let Some(storage_options) = options.get_item("storage_options")? {
+            let storage_options = storage_options.extract::<Option<HashMap<String, String>>>()?;
+            if let Some(storage_options) = storage_options {
+                p.store_params = Some(ObjectStoreParams {
+                    storage_options: Some(storage_options),
+                    ..Default::default()
+                });
             }
         }
 
@@ -1215,6 +1170,169 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         Some(p)
     };
     Ok(params)
+}
+
+fn prepare_vector_index_params(
+    index_type: &str,
+    column_type: &DataType,
+    kwargs: Option<&PyDict>,
+) -> PyResult<Box<dyn IndexParams>> {
+    let mut m_type = MetricType::L2;
+    let mut ivf_params = IvfBuildParams::default();
+    let mut hnsw_params = HnswBuildParams::default();
+    let mut pq_params = PQBuildParams::default();
+    let mut sq_params = SQBuildParams::default();
+
+    if let Some(kwargs) = kwargs {
+        // Parse metric type
+        if let Some(mt) = kwargs.get_item("metric_type")? {
+            m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+
+        // Parse sample rate
+        if let Some(sample_rate) = kwargs.get_item("sample_rate")? {
+            let sample_rate = PyAny::downcast::<PyInt>(sample_rate)?.extract()?;
+            ivf_params.sample_rate = sample_rate;
+            pq_params.sample_rate = sample_rate;
+            sq_params.sample_rate = sample_rate;
+        }
+
+        // Parse IVF params
+        if let Some(n) = kwargs.get_item("num_partitions")? {
+            ivf_params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
+        };
+
+        if let Some(c) = kwargs.get_item("ivf_centroids")? {
+            let batch = RecordBatch::from_pyarrow(c)?;
+            if "_ivf_centroids" != batch.schema().field(0).name() {
+                return Err(PyValueError::new_err(
+                    "Expected '_ivf_centroids' as the first column name.",
+                ));
+            }
+
+            // It's important that the centroids are the same data type
+            // as the vectors that will be indexed.
+            let mut centroids: Arc<dyn Array> = batch.column(0).clone();
+            if centroids.data_type() != column_type {
+                centroids = lance_arrow::cast::cast_with_options(
+                    centroids.as_ref(),
+                    column_type,
+                    &Default::default(),
+                )
+                .map_err(|e| {
+                    PyValueError::new_err(format!("Failed to cast centroids to column type: {}", e))
+                })?;
+            }
+            let centroids = as_fixed_size_list_array(centroids.as_ref());
+
+            ivf_params.centroids = Some(Arc::new(centroids.clone()))
+        };
+
+        if let Some(f) = kwargs.get_item("precomputed_partitions_file")? {
+            ivf_params.precomputed_partitons_file = Some(f.to_string());
+        };
+
+        match (
+                kwargs.get_item("precomputed_shuffle_buffers")?,
+                kwargs.get_item("precomputed_shuffle_buffers_path")?
+            ) {
+                (Some(l), Some(p)) => {
+                    let path = Path::parse(p.to_string()).map_err(|e| {
+                        PyValueError::new_err(format!(
+                            "Failed to parse precomputed_shuffle_buffers_path: {}",
+                            e
+                        ))
+                    })?;
+                    let list = PyAny::downcast::<PyList>(l)?
+                        .iter()
+                        .map(|f| f.to_string())
+                        .collect();
+                    ivf_params.precomputed_shuffle_buffers = Some((path, list));
+                },
+                (None, None) => {},
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "precomputed_shuffle_buffers and precomputed_shuffle_buffers_path must be specified together."
+                    ))
+                }
+            }
+
+        // Parse HNSW params
+        if let Some(max_level) = kwargs.get_item("max_level")? {
+            hnsw_params.max_level = PyAny::downcast::<PyInt>(max_level)?.extract()?;
+        }
+
+        if let Some(m) = kwargs.get_item("m")? {
+            hnsw_params.m = PyAny::downcast::<PyInt>(m)?.extract()?;
+        }
+
+        if let Some(m_max) = kwargs.get_item("m_max")? {
+            hnsw_params.m_max = PyAny::downcast::<PyInt>(m_max)?.extract()?;
+        }
+
+        if let Some(ef_c) = kwargs.get_item("ef_construction")? {
+            hnsw_params.ef_construction = PyAny::downcast::<PyInt>(ef_c)?.extract()?;
+        }
+
+        // Parse PQ params
+        if let Some(n) = kwargs.get_item("num_bits")? {
+            pq_params.num_bits = PyAny::downcast::<PyInt>(n)?.extract()?
+        };
+
+        if let Some(n) = kwargs.get_item("num_sub_vectors")? {
+            pq_params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
+        };
+
+        if let Some(o) = kwargs.get_item("use_opq")? {
+            #[cfg(not(feature = "opq"))]
+            if PyAny::downcast::<PyBool>(o)?.extract()? {
+                return Err(PyValueError::new_err(
+                    "Feature 'opq' is not installed.".to_string(),
+                ));
+            }
+            pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
+        };
+
+        if let Some(c) = kwargs.get_item("pq_codebook")? {
+            let batch = RecordBatch::from_pyarrow(c)?;
+            if "_pq_codebook" != batch.schema().field(0).name() {
+                return Err(PyValueError::new_err(
+                    "Expected '_pq_codebook' as the first column name.",
+                ));
+            }
+            let codebook = as_fixed_size_list_array(batch.column(0));
+            pq_params.codebook = Some(codebook.values().clone())
+        };
+
+        if let Some(o) = kwargs.get_item("max_opq_iterations")? {
+            pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
+        };
+    }
+
+    match index_type {
+        "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(
+            m_type, ivf_params, pq_params,
+        ))),
+
+        "IVF_HNSW_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
+            m_type,
+            ivf_params,
+            hnsw_params,
+            pq_params,
+        ))),
+
+        "IVF_HNSW_SQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_sq_params(
+            m_type,
+            ivf_params,
+            hnsw_params,
+            sq_params,
+        ))),
+
+        _ => Err(PyValueError::new_err(format!(
+            "Index type '{index_type}' is not supported."
+        ))),
+    }
 }
 
 #[pyclass(name = "_FragmentWriteProgress", module = "_lib")]

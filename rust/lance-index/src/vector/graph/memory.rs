@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! In-memory graph representations.
 
@@ -22,13 +11,16 @@ use lance_linalg::{distance::MetricType, MatrixView};
 
 /// All data are stored in memory
 pub struct InMemoryVectorStorage {
+    row_ids: Vec<u64>,
     vectors: Arc<MatrixView<Float32Type>>,
     metric_type: MetricType,
 }
 
 impl InMemoryVectorStorage {
     pub fn new(vectors: Arc<MatrixView<Float32Type>>, metric_type: MetricType) -> Self {
+        let row_ids = (0..vectors.num_rows() as u64).collect();
         Self {
+            row_ids,
             vectors,
             metric_type,
         }
@@ -47,8 +39,16 @@ impl InMemoryVectorStorage {
 }
 
 impl VectorStorage for InMemoryVectorStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn len(&self) -> usize {
         self.vectors.num_rows()
+    }
+
+    fn row_ids(&self) -> &[u64] {
+        &self.row_ids
     }
 
     fn metric_type(&self) -> MetricType {
@@ -71,12 +71,9 @@ struct InMemoryDistanceCal {
 }
 
 impl DistCalculator for InMemoryDistanceCal {
-    fn distance(&self, ids: &[u32]) -> Vec<f32> {
-        ids.iter()
-            .map(|id| {
-                let vector = self.vectors.row(*id as usize).unwrap();
-                self.metric_type.func()(&self.query, vector)
-            })
-            .collect()
+    #[inline]
+    fn distance(&self, id: u32) -> f32 {
+        let vector = self.vectors.row(id as usize).unwrap();
+        self.metric_type.func()(&self.query, vector)
     }
 }
