@@ -28,13 +28,13 @@ from functools import partial
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union
 
 import pyarrow as pa
-import tensorflow as tf
 
 import lance
 from lance import LanceDataset
 from lance.arrow import EncodedImageType, FixedShapeImageTensorType, ImageURIType
 from lance.dependencies import _check_for_numpy
 from lance.dependencies import numpy as np
+from lance.dependencies import tensorflow as tf
 from lance.fragment import FragmentMetadata, LanceFragment
 
 if TYPE_CHECKING:
@@ -145,7 +145,7 @@ def column_to_tensor(array: pa.Array, tensor_spec: tf.TensorSpec) -> tf.Tensor:
 def from_lance(
     dataset: Union[str, Path, LanceDataset],
     *,
-    columns: Optional[List[str]] = None,
+    columns: Optional[Union[List[str], Dict[str, str]]] = None,
     batch_size: int = 256,
     filter: Optional[str] = None,
     fragments: Union[Iterable[int], Iterable[LanceFragment], tf.data.Dataset] = None,
@@ -326,7 +326,7 @@ def lance_take_batches(
     dataset: Union[str, Path, LanceDataset],
     batch_ranges: Iterable[Tuple[int, int]],
     *,
-    columns: Optional[List[str]] = None,
+    columns: Optional[Union[List[str], Dict[str, str]]] = None,
     output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
     batch_readahead: int = 10,
 ) -> tf.data.Dataset:

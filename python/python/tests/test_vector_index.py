@@ -78,9 +78,9 @@ def run(ds, q=None, assert_func=None):
             expected_columns.extend(ds.schema.names)
         else:
             expected_columns.extend(columns)
-        for c in ["vector", "_distance"]:
-            if c not in expected_columns:
-                expected_columns.append(c)
+        # TODO: _distance shouldn't be returned by default either
+        if "_distance" not in expected_columns:
+            expected_columns.append("_distance")
 
         for filter_ in filters:
             for rf in refine:
@@ -130,6 +130,8 @@ def test_ann_append(tmp_path):
     q = new_data["vector"][0].as_py()
 
     def func(rs: pa.Table):
+        if "vector" not in rs:
+            return
         assert rs["vector"][0].as_py() == q
 
     run(dataset, q=np.array(q), assert_func=func)
@@ -539,20 +541,20 @@ def test_knn_with_deletions(tmp_path):
 def test_index_cache_size(tmp_path):
     rng = np.random.default_rng(seed=42)
 
-    def query_index(ds, ntimes):
+    def query_index(ds, ntimes, q=None):
         ndim = ds.schema[0].type.list_size
         for _ in range(ntimes):
             ds.to_table(
                 nearest={
                     "column": "vector",
-                    "q": rng.standard_normal(ndim),
+                    "q": q if q is not None else rng.standard_normal(ndim),
                 },
             )
 
     tbl = create_table(nvec=1024, ndim=16)
     dataset = lance.write_dataset(tbl, tmp_path / "test")
 
-    indexed_dataset = dataset.create_index(
+    dataset.create_index(
         "vector",
         index_type="IVF_PQ",
         num_partitions=128,
@@ -560,12 +562,24 @@ def test_index_cache_size(tmp_path):
         index_cache_size=10,
     )
 
+    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=0)
+    # when there is no hit, the hit rate is hard coded to 1.0
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 1.0)
     query_index(indexed_dataset, 1)
-    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.4)
+    # index cache is size=0, there should be no hit
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.0)
+
+    indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=1)
+    # query using the same vector, we should get a very high hit rate
+    query_index(indexed_dataset, 100, q=rng.standard_normal(16))
+    assert indexed_dataset._ds.index_cache_hit_rate() > 0.99
+
+    last_hit_rate = indexed_dataset._ds.index_cache_hit_rate()
+
+    # send a few queries with different vectors, the hit rate should drop
     query_index(indexed_dataset, 128)
-    indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=5)
-    query_index(indexed_dataset, 128)
-    assert indexed_dataset._ds.index_cache_entry_count() == 6
+
+    assert last_hit_rate > indexed_dataset._ds.index_cache_hit_rate()
 
 
 def test_f16_index(tmp_path: Path):
@@ -639,3 +653,29 @@ def test_validate_vector_index(tmp_path: Path):
     ds.sample = direct_first_call_to_new_table
     with pytest.raises(ValueError, match="Vector index failed sanity check"):
         validate_vector_index(ds, "vector", sample_size=100)
+
+
+def test_dynamic_projection_with_vectors_index(tmp_path: Path):
+    ds = lance.write_dataset(create_table(), tmp_path)
+    ds = ds.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+    )
+
+    res = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+        },
+        columns={
+            "vec": "vector",
+            "vec_f16": "_cast_list_f16(vector)",
+        },
+    )
+
+    # TODO: _distance shouldn't be returned by default
+    assert res.column_names == ["vec", "vec_f16", "_distance"]
+
+    original = np.stack(res["vec"].to_numpy())
+    casted = np.stack(res["vec_f16"].to_numpy())
+
+    assert (original.astype(np.float16) == casted).all()

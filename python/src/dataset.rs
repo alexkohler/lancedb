@@ -25,6 +25,7 @@ use chrono::Duration;
 
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::ColumnAlteration;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
@@ -32,10 +33,8 @@ use lance::dataset::{
     UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
     WriteParams,
 };
-use lance::index::{
-    scalar::ScalarIndexParams,
-    vector::{diskann::DiskANNParams, VectorIndexParams},
-};
+use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
+use lance::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
 use lance_index::optimize::OptimizeOptions;
@@ -54,7 +53,7 @@ use pyo3::types::{PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
-    types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong},
+    types::{IntoPyDict, PyBool, PyDict, PyInt, PyLong},
     PyObject, PyResult,
 };
 use snafu::{location, Location};
@@ -134,8 +133,18 @@ impl MergeInsertBuilder {
         Ok(Self { builder, dataset })
     }
 
-    pub fn when_matched_update_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
-        slf.builder.when_matched(WhenMatched::UpdateAll);
+    pub fn when_matched_update_all<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        condition: Option<&str>,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        let new_val = if let Some(expr) = condition {
+            let dataset = slf.dataset.borrow(slf.py());
+            WhenMatched::update_if(&dataset.ds, expr)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?
+        } else {
+            WhenMatched::UpdateAll
+        };
+        slf.builder.when_matched(new_val);
         Ok(slf)
     }
 
@@ -373,6 +382,7 @@ impl Dataset {
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
+        columns_with_transform: Option<Vec<(String, String)>>,
         filter: Option<String>,
         prefilter: Option<bool>,
         limit: Option<i64>,
@@ -388,10 +398,23 @@ impl Dataset {
         substrait_filter: Option<Vec<u8>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
-        if let Some(c) = columns {
-            scanner
-                .project(&c)
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        match (columns, columns_with_transform) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "Cannot specify both columns and columns_with_transform",
+                ))
+            }
+            (Some(c), None) => {
+                scanner
+                    .project(&c)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            (None, Some(ct)) => {
+                scanner
+                    .project_with_transform(&ct)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            (None, None) => {}
         }
         if let Some(f) = filter {
             if substrait_filter.is_some() {
@@ -628,6 +651,64 @@ impl Dataset {
         Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
     }
 
+    fn alter_columns(&mut self, alterations: &PyList) -> PyResult<()> {
+        let alterations = alterations
+            .iter()
+            .map(|obj| {
+                let obj = obj.downcast::<PyDict>()?;
+                let path: String = obj
+                    .get_item("path")?
+                    .ok_or_else(|| PyValueError::new_err("path is required"))?
+                    .extract()?;
+                let name: Option<String> =
+                    obj.get_item("name")?.map(|n| n.extract()).transpose()?;
+                let nullable: Option<bool> =
+                    obj.get_item("nullable")?.map(|n| n.extract()).transpose()?;
+                let data_type: Option<PyArrowType<DataType>> = obj
+                    .get_item("data_type")?
+                    .map(|n| n.extract())
+                    .transpose()?;
+
+                for key in obj.keys().iter().map(|k| k.extract::<String>()) {
+                    let k = key?;
+                    if k != "path" && k != "name" && k != "nullable" && k != "data_type" {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown key: {}. Valid keys are name, nullable, and data_type.",
+                            k
+                        )));
+                    }
+                }
+
+                if name.is_none() && nullable.is_none() && data_type.is_none() {
+                    return Err(PyValueError::new_err(
+                        "At least one of name, nullable, or data_type must be specified",
+                    ));
+                }
+
+                let mut alteration = ColumnAlteration::new(path);
+                if let Some(name) = name {
+                    alteration = alteration.rename(name);
+                }
+                if let Some(nullable) = nullable {
+                    alteration = alteration.set_nullable(nullable);
+                }
+                if let Some(data_type) = data_type {
+                    alteration = alteration.cast_to(data_type.0);
+                }
+                Ok(alteration)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let mut new_self = self.ds.as_ref().clone();
+        new_self = RT
+            .spawn(None, async move {
+                new_self.alter_columns(&alterations).await.map(|_| new_self)
+            })?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     fn merge(
         &mut self,
         reader: PyArrowType<ArrowArrayStreamReader>,
@@ -794,7 +875,7 @@ impl Dataset {
     ) -> PyResult<()> {
         let idx_type = match index_type.to_uppercase().as_str() {
             "BTREE" => IndexType::Scalar,
-            "IVF_PQ" | "DISKANN" => IndexType::Vector,
+            "IVF_PQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -896,29 +977,6 @@ impl Dataset {
                     m_type, ivf_params, pq_params,
                 ))
             }
-            "DISKANN" => {
-                let mut params = DiskANNParams::default();
-                let mut m_type = MetricType::L2;
-                if let Some(kwargs) = kwargs {
-                    if let Some(mt) = kwargs.get_item("metric_type")? {
-                        m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
-                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-                    }
-
-                    if let Some(n) = kwargs.get_item("r")? {
-                        params.r = PyAny::downcast::<PyInt>(n)?.extract()?
-                    };
-
-                    if let Some(n) = kwargs.get_item("alpha")? {
-                        params.alpha = PyAny::downcast::<PyFloat>(n)?.extract()?
-                    };
-
-                    if let Some(n) = kwargs.get_item("l")? {
-                        params.l = PyAny::downcast::<PyInt>(n)?.extract()?
-                    };
-                }
-                Box::new(VectorIndexParams::with_diskann_params(m_type, params))
-            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -1002,6 +1060,82 @@ impl Dataset {
     fn validate(&self) -> PyResult<()> {
         RT.block_on(None, self.ds.validate())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    fn drop_columns(&mut self, columns: Vec<&str>) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.drop_columns(&columns))?
+            .map_err(|err| match err {
+                lance::Error::InvalidInput { source, .. } => {
+                    PyValueError::new_err(source.to_string())
+                }
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    fn add_columns(
+        &mut self,
+        transforms: &PyAny,
+        read_columns: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        let transforms = if let Ok(transforms) = transforms.extract::<&PyDict>() {
+            let expressions = transforms
+                .iter()
+                .map(|(k, v)| {
+                    let col = k.extract::<String>()?;
+                    let expr = v.extract::<String>()?;
+                    Ok((col, expr))
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            NewColumnTransform::SqlExpressions(expressions)
+        } else {
+            let append_schema: PyArrowType<ArrowSchema> =
+                transforms.getattr("output_schema")?.extract()?;
+            let output_schema = Arc::new(append_schema.0);
+
+            let result_checkpoint: Option<PyObject> = transforms.getattr("cache")?.extract()?;
+            let result_checkpoint =
+                result_checkpoint.map(|c| PyBatchUDFCheckpointWrapper { inner: c });
+
+            let udf_obj = transforms.to_object(transforms.py());
+            let mapper = move |batch: &RecordBatch| -> lance::Result<RecordBatch> {
+                Python::with_gil(|py| {
+                    let py_batch: PyArrowType<RecordBatch> = PyArrowType(batch.clone());
+                    let result = udf_obj
+                        .call_method1(py, "_call", (py_batch,))
+                        .map_err(|err| lance::Error::IO {
+                            message: format_python_error(err, py).unwrap(),
+                            location: location!(),
+                        })?;
+                    let result_batch: PyArrowType<RecordBatch> =
+                        result.extract(py).map_err(|err| lance::Error::IO {
+                            message: err.to_string(),
+                            location: location!(),
+                        })?;
+                    Ok(result_batch.0)
+                })
+            };
+
+            NewColumnTransform::BatchUDF(BatchUDF {
+                mapper: Box::new(mapper),
+                output_schema,
+                result_checkpoint: result_checkpoint
+                    .map(|c| Arc::new(c) as Arc<dyn UDFCheckpointStore>),
+            })
+        };
+
+        let mut new_self = self.ds.as_ref().clone();
+        let new_self = RT
+            .spawn(None, async move {
+                new_self.add_columns(transforms, read_columns).await?;
+                Ok(new_self)
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+
+        Ok(())
     }
 }
 
@@ -1128,5 +1262,100 @@ impl WriteFragmentProgress for PyWriteProgress {
             location: location!(),
         })?;
         Ok(())
+    }
+}
+
+/// Formats a Python error just as it would in Python interpreter.
+fn format_python_error(e: PyErr, py: Python) -> PyResult<String> {
+    let sys_mod = py.import("sys")?;
+    // the traceback is the third element of the tuple returned by sys.exc_info()
+    let traceback = sys_mod.call_method0("exc_info")?.get_item(2)?;
+
+    let tracback_mod = py.import("traceback")?;
+    let fmt_func = tracback_mod.getattr("format_exception")?;
+    let e_type = e.get_type(py).to_owned();
+    let formatted = fmt_func.call1((e_type, &e, traceback))?;
+    let lines: Vec<String> = formatted.extract()?;
+    Ok(lines.join(""))
+}
+
+struct PyBatchUDFCheckpointWrapper {
+    inner: PyObject,
+}
+
+impl PyBatchUDFCheckpointWrapper {
+    fn batch_info_to_py(&self, info: &BatchInfo, py: Python) -> PyResult<PyObject> {
+        self.inner
+            .getattr(py, "BatchInfo")?
+            .call1(py, (info.fragment_id, info.batch_index))
+    }
+}
+
+impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
+    fn get_batch(&self, info: &BatchInfo) -> lance::Result<Option<RecordBatch>> {
+        Python::with_gil(|py| {
+            let info = self.batch_info_to_py(info, py)?;
+            let batch = self.inner.call_method1(py, "get_batch", (info,))?;
+            let batch: Option<PyArrowType<RecordBatch>> = batch.extract(py)?;
+            Ok(batch.map(|b| b.0))
+        })
+        .map_err(|err: PyErr| lance_core::Error::IO {
+            message: format!("Failed to call get_batch() on UDFCheckpointer: {}", err),
+            location: location!(),
+        })
+    }
+
+    fn get_fragment(&self, fragment_id: u32) -> lance::Result<Option<Fragment>> {
+        let fragment_data = Python::with_gil(|py| {
+            let fragment = self
+                .inner
+                .call_method1(py, "get_fragment", (fragment_id,))?;
+            let fragment: Option<String> = fragment.extract(py)?;
+            Ok(fragment)
+        })
+        .map_err(|err: PyErr| lance_core::Error::IO {
+            message: format!("Failed to call get_fragment() on UDFCheckpointer: {}", err),
+            location: location!(),
+        })?;
+        fragment_data
+            .map(|data| {
+                serde_json::from_str(&data).map_err(|err| lance::Error::IO {
+                    message: format!("Failed to deserialize fragment data: {}", err),
+                    location: location!(),
+                })
+            })
+            .transpose()
+    }
+
+    fn insert_batch(&self, info: BatchInfo, batch: RecordBatch) -> lance::Result<()> {
+        Python::with_gil(|py| {
+            let info = self.batch_info_to_py(&info, py)?;
+            let batch = PyArrowType(batch);
+            self.inner.call_method1(py, "insert_batch", (info, batch))?;
+            Ok(())
+        })
+        .map_err(|err: PyErr| lance_core::Error::IO {
+            message: format!("Failed to call insert_batch() on UDFCheckpointer: {}", err),
+            location: location!(),
+        })
+    }
+
+    fn insert_fragment(&self, fragment: Fragment) -> lance_core::Result<()> {
+        let data = serde_json::to_string(&fragment).map_err(|err| lance_core::Error::IO {
+            message: format!("Failed to serialize fragment data: {}", err),
+            location: location!(),
+        })?;
+        Python::with_gil(|py| {
+            self.inner
+                .call_method1(py, "insert_fragment", (fragment.id, data))?;
+            Ok(())
+        })
+        .map_err(|err: PyErr| lance_core::Error::IO {
+            message: format!(
+                "Failed to call insert_fragment() on UDFCheckpointer: {}",
+                err
+            ),
+            location: location!(),
+        })
     }
 }

@@ -24,7 +24,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from heapq import heappush, heappushpop
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, List, Optional, TypeVar, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, TypeVar, Union
 
 import pyarrow as pa
 
@@ -34,13 +34,20 @@ from lance.dependencies import numpy as np
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-__all__ = ["maybe_sample"]
+__all__ = [
+    "maybe_sample",
+    "Sampler",
+    "FragmentSampler",
+    "FullScanSampler",
+    "ShardedFragmentSampler",
+    "ShardedBatchSampler",
+]
 
 
 def _efficient_sample(
     dataset: lance.LanceDataset,
     n: int,
-    columns: list[str],
+    columns: Optional[Union[List[str], Dict[str, str]]],
     batch_size: int,
     max_takes: int,
 ) -> Generator[pa.RecordBatch, None, None]:
@@ -113,7 +120,7 @@ def _efficient_sample(
 def maybe_sample(
     dataset: Union[str, Path, lance.LanceDataset],
     n: int,
-    columns: Union[list[str], str],
+    columns: Union[list[str], dict[str, str], str],
     batch_size: int = 10240,
     max_takes: int = 2048,
 ) -> Generator[pa.RecordBatch, None, None]:
@@ -125,7 +132,7 @@ def maybe_sample(
         The dataset to sample from.
     n : int
         The number of records to sample.
-    columns : Union[list[str], str]
+    columns : Union[list[str], dict[str, str], str]
         The columns to load.
     batch_size : int, optional
         The batch size to use when loading the data, by default 10240.
@@ -202,7 +209,8 @@ class Sampler(ABC):
         ds: lance.LanceDataset,
         *args,
         batch_size: int = 128,
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        filter: Optional[str] = None,
         batch_readahead: int = 16,
         with_row_id: bool = False,
         **kwargs,
@@ -223,7 +231,8 @@ class FragmentSampler(Sampler):
         dataset: lance.LanceDataset,
         *args,
         batch_size: int = 128,
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        filter: Optional[str] = None,
         batch_readahead: int = 16,
         with_row_id: bool = False,
         **kwargs,
@@ -232,6 +241,7 @@ class FragmentSampler(Sampler):
             for batch in fragment.to_batches(
                 batch_size=batch_size,
                 columns=columns,
+                filter=filter,
                 with_row_id=with_row_id,
                 batch_readahead=batch_readahead,
             ):
@@ -258,22 +268,25 @@ class ShardedFragmentSampler(FragmentSampler):
     """Sharded fragments by rank and world_size.
 
     Each rank / process will process a subset of the fragments.
+    It yields batches from ``ds.fragments[rank::world_size]``.
+
+    This sampler is more efficient than `ShardedBatchSampler` when the dataset is large.
+
+    Parameters
+    ----------
+    rank : int
+        The rank of the process in the distributed cluster.
+    world_size : int
+        The total number of processes in the distributed cluster.
+    randomize : bool
+        If set true, randomize
+    seed : int
+        The random seed to use when randomize is set true.
     """
 
     def __init__(
         self, rank: int, world_size: int, randomize: bool = False, seed: int = 0
     ):
-        """Initialize the ShardedFragmentSampler.
-
-        Parameters
-        ----------
-        rank : int
-            The rank of the process in the distributed cluster.
-        world_size : int
-            The total number of processes in the distributed cluster.
-        randomize : bool
-            If set true, randomize
-        """
         super().__init__()
 
         self._rank = rank
@@ -285,9 +298,7 @@ class ShardedFragmentSampler(FragmentSampler):
     def from_torch(randomize: bool = False, seed: int = 0) -> ShardedFragmentSampler:
         """Use from a PyTorch distributed environment.
 
-        Automatically infer `rank` and `world_size` from `torch.distributed`.
-
-        Other parameters, see :py:meth:`ShardedBatchIterator.__init__`.
+        Automatically infer `rank` and `world_size` from :mod:`torch.distributed`.
         """
         import torch
 
@@ -310,6 +321,21 @@ class ShardedBatchSampler(Sampler):
     """Sharded batch sampler.
 
     Each rank / process will process a subset of the batches.
+
+    The input is subdivided into batches (of size `batch_size`).  Each rank / process
+    takes every Nth batch (where N is the world size).  The order in which batches
+    are loaded is randomized.
+
+    When there is no filter then each process only needs to load the rows assigned to
+    it but this process is still slightly less efficient than ShardedFragmentSampler
+    since it requires loading rows by range instead of loading all rows for a
+    given fragment.
+
+    If there is a filter then we cannot divide the row ids ahead of time.  Instead,
+    each process will load the entire filtered dataset and discard the rows that are
+    not assigned to it.  The resulting stream is then randomized via a reservoir
+    sampler.  This does not perfectly randomize the stream but it should generate
+    a stream that is random enough for many use cases.
     """
 
     def __init__(
@@ -332,22 +358,107 @@ class ShardedBatchSampler(Sampler):
         world_size = torch.distributed.get_world_size()
         return ShardedBatchSampler(rank, world_size, randomize=randomize, seed=seed)
 
-    def __call__(
+    # Performs a filtered scan of the dataset and then throws away all but the Nth
+    # rows (where N is the world size)
+    def _shard_scan(
         self,
         dataset: lance.LanceDataset,
-        *args,
-        batch_size: int = 128,
-        columns: Optional[List[str]] = None,
-        batch_readahead: int = 16,
-        with_row_id: Optional[bool] = None,
-        **kwargs,
+        batch_size: int,
+        columns: Optional[Union[List[str], Dict[str, str]]],
+        batch_readahead: int,
+        filter: str,
+    ) -> Generator[lance.RecordBatch, None, None]:
+        accumulated_batches = []
+        rows_accumulated = 0
+        rows_to_skip = self._rank
+        for batch in dataset.scanner(
+            columns=columns,
+            batch_readahead=batch_readahead,
+            filter=filter,
+            scan_in_order=True,
+        ).to_batches():
+            batch = batch.slice(rows_to_skip, batch.num_rows - rows_to_skip)
+            # Take every Nth row
+            indices = list(range(0, batch.num_rows, self._world_size))
+            rows_to_skip = (
+                self._world_size - (batch.num_rows % self._world_size)
+            ) % self._world_size
+            batch = batch.take(indices)
+
+            # Add to our collection
+            rows_accumulated += batch.num_rows
+            accumulated_batches.append(batch)
+
+            # If we have enough to generate 1 or more batches then do so
+            if rows_accumulated > batch_size:
+                big_batch = (
+                    pa.Table.from_batches(accumulated_batches)
+                    .combine_chunks()
+                    .to_batches()[0]
+                )
+                accumulated_batches = []
+                while big_batch.num_rows > batch_size:
+                    next_batch = big_batch.slice(0, batch_size)
+                    big_batch = big_batch.slice(batch_size)
+                    yield next_batch
+                rows_accumulated = big_batch.num_rows
+                if big_batch.num_rows > 0:
+                    accumulated_batches.append(big_batch)
+        # deliver any batches left over, they will be <= batch
+        # size but that is ok because we are done
+        last_batch = (
+            pa.Table.from_batches(accumulated_batches).combine_chunks().to_batches()[0]
+        )
+        yield last_batch
+
+    def _sample_filtered(
+        self,
+        dataset: lance.LanceDataset,
+        batch_size: int,
+        columns: Optional[Union[List[str], Dict[str, str]]],
+        batch_readahead: int,
+        filter: str,
+    ) -> Generator[lance.RecordBatch, None, None]:
+        shard_scan = self._shard_scan(
+            dataset, batch_size, columns, batch_readahead, filter
+        )
+        if not self._randomize:
+            yield from shard_scan
+
+        random.seed(self._seed)
+        heap = []
+        # We want to randomize the incoming sequence.  The normal approach
+        # is to pull the whole thing in memory and run fisher-yates.  We
+        # want to avoid buffering the entire input.  So, as an approximation,
+        # we are using a heap + random number in a style similar to reservoir
+        # sampling.
+        #
+        # We will keep up to k batches in the reservoir.  The higher
+        # k the more randomness we will get from the reservoir shuffle
+        # but the more memory we need.
+        #
+        # Picking 256 as a heuristic which should be 32Ki rows with
+        # the default batch size
+        k = 256
+        for batch in shard_scan:
+            priority = random.randint(0, k * 2 - 1)
+            entry = PrioritizedItem(priority, batch)
+            if len(heap) < k:
+                heappush(heap, entry)
+            else:
+                next_batch = heappushpop(heap, entry)
+                yield next_batch.item
+        for batch in heap:
+            yield batch.item
+
+    def _sample_all(
+        self,
+        dataset: lance.LanceDataset,
+        batch_size: int,
+        columns: Optional[Union[List[str], Dict[str, str]]],
+        batch_readahead: int,
     ) -> Generator[lance.RecordBatch, None, None]:
         total = dataset.count_rows()
-
-        if with_row_id is not None:
-            warnings.warn(
-                "with_row_id is not supported for ShardedBatchSampler",
-            )
 
         def _gen_ranges():
             for start in range(
@@ -367,3 +478,25 @@ class ShardedBatchSampler(Sampler):
             columns=columns,
             batch_readahead=batch_readahead,
         )
+
+    def __call__(
+        self,
+        dataset: lance.LanceDataset,
+        *args,
+        batch_size: int = 128,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        filter: Optional[str] = None,
+        batch_readahead: int = 16,
+        with_row_id: Optional[bool] = None,
+        **kwargs,
+    ) -> Generator[lance.RecordBatch, None, None]:
+        if filter is None:
+            if with_row_id is not None:
+                warnings.warn(
+                    "with_row_id is not supported for ShardedBatchSampler",
+                )
+            return self._sample_all(dataset, batch_size, columns, batch_readahead)
+        else:
+            return self._sample_filtered(
+                dataset, batch_size, columns, batch_readahead, filter
+            )

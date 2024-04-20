@@ -18,7 +18,9 @@ from __future__ import annotations
 import copy
 import json
 import os
+import pickle
 import random
+import sqlite3
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -32,6 +34,7 @@ from typing import (
     Iterator,
     List,
     Literal,
+    NamedTuple,
     Optional,
     TypedDict,
     Union,
@@ -109,7 +112,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
     # These next three overrides exist only to document the methods
 
-    def when_matched_update_all(self):
+    def when_matched_update_all(self, condition: Optional[str] = None):
         """
         Configure the operation to update matched rows
 
@@ -117,8 +120,18 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         any rows that match both the source table and the target table will be
         updated.  The rows from the target table will be removed and the rows
         from the source table will be added.
+
+        An optional condition may be specified.  This should be an SQL filter
+        and, if present, then only matched rows that also satisfy this filter will
+        be updated.  The SQL filter should use the prefix `target.` to refer to
+        columns in the target table and the prefix `source.` to refer to columns
+        in the source table.  For example, `source.last_update < target.last_update`.
+
+        If a condition is specified and rows do not satisfy the condition then these
+        rows will not be updated.  Failure to satisfy the filter does not cause
+        a "matched" row to become a "not matched" row.
         """
-        return super(MergeInsertBuilder, self).when_matched_update_all()
+        return super(MergeInsertBuilder, self).when_matched_update_all(condition)
 
     def when_not_matched_insert_all(self):
         """
@@ -200,7 +213,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def scanner(
         self,
-        columns: Optional[list[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
@@ -219,9 +232,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         Parameters
         ----------
-        columns: list of str, default None
+        columns: list of str, or dict of str to str default None
             List of column names to be fetched.
-            All columns if None or unspecified.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
         filter: pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
             `Lance filter pushdown <https://lancedb.github.io/lance/read_and_write.html#filter-push-down>`_
@@ -315,7 +329,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def to_table(
         self,
-        columns: Optional[list[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
@@ -333,9 +347,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         Parameters
         ----------
-        columns: list of str, default None
+        columns: list of str, or dict of str to str default None
             List of column names to be fetched.
-            All columns if None or unspecified.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
         filter : pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
             `Lance filter pushdown <https://lancedb.github.io/lance/read_and_write.html#filter-push-down>`_
@@ -430,7 +445,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def to_batches(
         self,
-        columns: Optional[list[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
@@ -474,7 +489,7 @@ class LanceDataset(pa.dataset.Dataset):
     def sample(
         self,
         num_rows: int,
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         randomize_order: bool = True,
         **kwargs,
     ) -> pa.Table:
@@ -484,9 +499,10 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         num_rows: int
             number of rows to retrieve
-        columns: list of strings, optional
-            list of column names to be fetched.  All columns are fetched
-            if not specified.
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
         **kwargs : dict, optional
             see scanner() method for full parameter description.
 
@@ -505,7 +521,7 @@ class LanceDataset(pa.dataset.Dataset):
     def take(
         self,
         indices: Union[List[int], pa.Array],
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         **kwargs,
     ) -> pa.Table:
         """Select rows of data by index.
@@ -514,9 +530,10 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         indices : Array or array-like
             indices of rows to select in the dataset.
-        columns: list of strings, optional
-            List of column names to be fetched. All columns are fetched
-            if not specified.
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
         **kwargs : dict, optional
             See scanner() method for full parameter description.
 
@@ -529,7 +546,7 @@ class LanceDataset(pa.dataset.Dataset):
     def _take_rows(
         self,
         row_ids: Union[List[int], pa.Array],
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         **kargs,
     ) -> pa.Table:
         """Select rows by row_ids.
@@ -540,9 +557,10 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         row_ids : List Array or array-like
             row IDs to select in the dataset.
-        columns: list of strings, optional
-            List of column names to be fetched. All columns are fetched
-            if not specified.
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
         **kwargs : dict, optional
             See scanner() method for full parameter description.
 
@@ -607,6 +625,61 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("Versioning not yet supported in Rust")
 
+    def alter_columns(self, *alterations: Iterable[Dict[str, Any]]):
+        """Alter column name, data type, and nullability.
+
+        Columns that are renamed can keep any indices that are on them. However, if
+        the column is cast to a different type, its indices will be dropped.
+
+        Column types can be upcasted (such as int32 to int64) or downcasted
+        (such as int64 to int32). However, downcasting will fail if there are
+        any values that cannot be represented in the new type. In general,
+        columns can be casted to same general type: integers to integers,
+        floats to floats, and strings to strings. However, strings, binary, and
+        list columns can be casted between their size variants. For example,
+        string to large string, binary to large binary, and list to large list.
+
+        Parameters
+        ----------
+        alterations : Iterable[Dict[str, Any]]
+            A sequence of dictionaries, each with the following keys:
+            - "path": str
+                The column path to alter. For a top-level column, this is the name.
+                For a nested column, this is the dot-separated path, e.g. "a.b.c".
+            - "name": str, optional
+                The new name of the column. If not specified, the column name is
+                not changed.
+            - "nullable": bool, optional
+                Whether the column should be nullable. If not specified, the column
+                nullability is not changed. Only non-nullable columns can be changed
+                to nullable. Currently, you cannot change a nullable column to
+                non-nullable.
+            - "data_type": pyarrow.DataType, optional
+                The new data type to cast the column to. If not specified, the column
+                data type is not changed.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([pa.field('a', pa.int64()),
+        ...                     pa.field('b', pa.string(), nullable=False)])
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.alter_columns({"path": "a", "name": "x"},
+        ...                       {"path": "b", "nullable": True})
+        >>> dataset.to_table().to_pandas()
+           x  b
+        0  1  a
+        1  2  b
+        2  3  c
+        >>> dataset.alter_columns({"path": "x", "data_type": pa.int32()})
+        >>> dataset.schema
+        x: int32
+        b: string
+        """
+        self._ds.alter_columns(list(alterations))
+
     def merge(
         self,
         data_obj: ReaderLike,
@@ -653,6 +726,11 @@ class LanceDataset(pa.dataset.Dataset):
         0  1  a  d
         1  2  b  e
         2  3  c  f
+
+        See Also
+        --------
+        LanceDataset.add_columns :
+            Add new columns by computing batch-by-batch.
         """
         if right_on is None:
             right_on = left_on
@@ -660,6 +738,121 @@ class LanceDataset(pa.dataset.Dataset):
         reader = _coerce_reader(data_obj, schema)
 
         self._ds.merge(reader, left_on, right_on)
+
+    def add_columns(
+        self,
+        transforms: Dict[str, str] | BatchUDF,
+        read_columns: List[str] | None = None,
+    ):
+        """
+        Add new columns with defined values.
+
+        There are two ways to specify the new columns. First, you can provide
+        SQL expressions for each new column. Second you can provide a UDF that
+        takes a batch of existing data and returns a new batch with the new
+        columns. These new columns will be appended to the dataset.
+
+        See the :func:`lance.add_columns_udf` decorator for more information on
+        writing UDFs.
+
+        Parameters
+        ----------
+        transforms : dict or AddColumnsUDF
+            If this is a dictionary, then the keys are the names of the new
+            columns and the values are SQL expression strings. These strings can
+            reference existing columns in the dataset.
+            If this is a AddColumnsUDF, then it is a UDF that takes a batch of
+            existing data and returns a new batch with the new columns.
+        read_columns : list of str, optional
+            The names of the columns that the UDF will read. If None, then the
+            UDF will read all columns. This is only used when transforms is a
+            UDF. Otherwise, the read columns are inferred from the SQL expressions.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3]})
+        >>> dataset = lance.write_dataset(table, "my_dataset")
+        >>> @lance.batch_udf()
+        ... def double_a(batch):
+        ...     df = batch.to_pandas()
+        ...     return pd.DataFrame({'double_a': 2 * df['a']})
+        >>> dataset.add_columns(double_a)
+        >>> dataset.to_table().to_pandas()
+           a  double_a
+        0  1         2
+        1  2         4
+        2  3         6
+        >>> dataset.add_columns({"triple_a": "a * 3"})
+        >>> dataset.to_table().to_pandas()
+           a  double_a  triple_a
+        0  1         2         3
+        1  2         4         6
+        2  3         6         9
+
+        See Also
+        --------
+        LanceDataset.merge :
+            Merge a pre-computed set of columns into the dataset.
+        """
+        if isinstance(transforms, BatchUDF):
+            if transforms.output_schema is None:
+                # Infer the schema based on the first batch
+                sample_batch = transforms(
+                    next(iter(self.to_batches(limit=1, columns=read_columns)))
+                )
+                if isinstance(sample_batch, pd.DataFrame):
+                    sample_batch = pa.RecordBatch.from_pandas(sample_batch)
+                transforms.output_schema = sample_batch.schema
+                del sample_batch
+        elif isinstance(transforms, dict):
+            for k, v in transforms.items():
+                if not isinstance(k, str):
+                    raise TypeError(f"Column names must be a string. Got {type(k)}")
+                if not isinstance(v, str):
+                    raise TypeError(
+                        f"Column expressions must be a string. Got {type(k)}"
+                    )
+        else:
+            raise TypeError("transforms must be a dict or AddColumnsUDF")
+
+        self._ds.add_columns(transforms, read_columns)
+
+        if isinstance(transforms, BatchUDF):
+            if transforms.cache is not None:
+                transforms.cache.cleanup()
+
+    def drop_columns(self, columns: List[str]):
+        """Drop one or more columns from the dataset
+
+        Parameters
+        ----------
+        columns : list of str
+            The names of the columns to drop. These can be nested column references
+            (e.g. "a.b.c") or top-level column names (e.g. "a").
+
+        This is a metadata-only operation and does not remove the data from the
+        underlying storage. In order to remove the data, you must subsequently
+        call ``compact_files`` to rewrite the data without the removed columns and
+        then call ``cleanup_files`` to remove the old files.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.drop_columns(["a"])
+        >>> dataset.to_table().to_pandas()
+           b
+        0  a
+        1  b
+        2  c
+        """
+        self._ds.drop_columns(columns)
+        # Indices might have changed
+        self._list_indices_res = None
 
     def delete(self, predicate: Union[str, pa.compute.Expression]):
         """
@@ -1677,6 +1870,7 @@ class ScannerBuilder:
         self._prefilter = None
         self._offset = None
         self._columns = None
+        self._columns_with_transform = None
         self._nearest = None
         self._batch_size: Optional[int] = None
         self._batch_readahead: Optional[int] = None
@@ -1726,10 +1920,19 @@ class ScannerBuilder:
         self._offset = n
         return self
 
-    def columns(self, cols: Optional[list[str]] = None) -> ScannerBuilder:
-        if cols is not None and len(cols) == 0:
-            cols = None
-        self._columns = cols
+    def columns(
+        self, cols: Optional[Union[List[str], Dict[str, str]]] = None
+    ) -> ScannerBuilder:
+        if cols is None:
+            self._columns = None
+        elif isinstance(cols, dict):
+            self._columns_with_transform = list(cols.items())
+        elif isinstance(cols, list):
+            self._columns = cols
+        else:
+            raise TypeError(
+                f"columns must be a list or dict[name, expression], got {type(cols)}"
+            )
         return self
 
     def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
@@ -1854,6 +2057,7 @@ class ScannerBuilder:
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
+            self._columns_with_transform,
             self._filter,
             self._prefilter,
             self._limit,
@@ -2307,3 +2511,147 @@ def _casting_recordbatch_iter(
                     f"Got:\n{batch.schema}"
                 )
         yield batch
+
+
+class BatchUDF:
+    """A user-defined function that can be passed to :meth:`LanceDataset.add_columns`.
+
+    Use :func:`lance.add_columns_udf` decorator to wrap a function with this class.
+    """
+
+    def __init__(self, func, output_schema=None, checkpoint_file=None):
+        self.func = func
+        self.output_schema = output_schema
+        if checkpoint_file is not None:
+            self.cache = BatchUDFCheckpoint(checkpoint_file)
+        else:
+            self.cache = None
+
+    def __call__(self, batch: pa.RecordBatch):
+        # Directly call inner function. This is to allow the user to test the
+        # function and have it behave exactly as it was written.
+        return self.func(batch)
+
+    def _call(self, batch: pa.RecordBatch):
+        if self.output_schema is None:
+            raise ValueError(
+                "output_schema must be provided when using a function that "
+                "returns a RecordBatch"
+            )
+        result = self.func(batch)
+
+        if _check_for_pandas(result):
+            if isinstance(result, pd.DataFrame):
+                result = pa.RecordBatch.from_pandas(result)
+        assert result.schema == self.output_schema, (
+            f"Output schema of function does not match the expected schema. "
+            f"Expected:\n{self.output_schema}\nGot:\n{result.schema}"
+        )
+        return result
+
+
+def batch_udf(output_schema=None, checkpoint_file=None):
+    """
+    Create a user defined function (UDF) that adds columns to a dataset.
+
+    This function is used to add columns to a dataset. It takes a function that
+    takes a single argument, a RecordBatch, and returns a RecordBatch. The
+    function is called once for each batch in the dataset. The function should
+    not modify the input batch, but instead create a new batch with the new
+    columns added.
+
+    Parameters
+    ----------
+    output_schema : Schema, optional
+        The schema of the output RecordBatch. This is used to validate the
+        output of the function. If not provided, the schema of the first output
+        RecordBatch will be used.
+    checkpoint_file : str or Path, optional
+        If specified, this file will be used as a cache for unsaved results of
+        this UDF. If the process fails, and you call add_columns again with this
+        same file, it will resume from the last saved state. This is useful for
+        long running processes that may fail and need to be resumed. This file
+        may get very large. It will hold up to an entire data files' worth of
+        results on disk, which can be multiple gigabytes of data.
+
+    Returns
+    -------
+    AddColumnsUDF
+    """
+
+    def inner(func):
+        return BatchUDF(func, output_schema, checkpoint_file)
+
+    return inner
+
+
+class BatchUDFCheckpoint:
+    """A cache for BatchUDF results to avoid recomputation.
+
+    This is backed by a SQLite database.
+    """
+
+    class BatchInfo(NamedTuple):
+        fragment_id: int
+        batch_index: int
+
+    def __init__(self, path):
+        self.path = path
+        # We don't re-use the connection because it's not thread safe
+        conn = sqlite3.connect(path)
+        # One table to store the results for each batch.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS batches
+            (fragment_id INT, batch_index INT, result BLOB)
+            """
+        )
+        # One table to store fully written (but not committed) fragments.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS fragments (fragment_id INT, data BLOB)"
+        )
+        conn.commit()
+
+    def cleanup(self):
+        os.remove(self.path)
+
+    def get_batch(self, info: BatchInfo) -> Optional[pa.RecordBatch]:
+        conn = sqlite3.connect(self.path)
+        cursor = conn.execute(
+            "SELECT result FROM batches WHERE fragment_id = ? AND batch_index = ?",
+            (info.fragment_id, info.batch_index),
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            return pickle.loads(row[0])
+        return None
+
+    def insert_batch(self, info: BatchInfo, batch: pa.RecordBatch):
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "INSERT INTO batches (fragment_id, batch_index, result) VALUES (?, ?, ?)",
+            (info.fragment_id, info.batch_index, pickle.dumps(batch)),
+        )
+        conn.commit()
+
+    def get_fragment(self, fragment_id: int) -> Optional[str]:
+        """Retrieves a fragment as a JSON string."""
+        conn = sqlite3.connect(self.path)
+        cursor = conn.execute(
+            "SELECT data FROM fragments WHERE fragment_id = ?", (fragment_id,)
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            return row[0]
+        return None
+
+    def insert_fragment(self, fragment_id: int, fragment: str):
+        """Save a JSON string of a fragment to the cache."""
+        # Clear all batches for the fragment
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "INSERT INTO fragments (fragment_id, data) VALUES (?, ?)",
+            (fragment_id, fragment),
+        )
+        conn.execute("DELETE FROM batches WHERE fragment_id = ?", (fragment_id,))
+        conn.commit()

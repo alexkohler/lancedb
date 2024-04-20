@@ -12,6 +12,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import os
+import pickle
 import re
 from pathlib import Path
 
@@ -23,6 +25,7 @@ import pytest
 from lance.arrow import (
     BFloat16,
     BFloat16Array,
+    FixedShapeImageTensorType,
     ImageArray,
     ImageURIArray,
     PandasBFloat16Array,
@@ -198,30 +201,40 @@ def test_roundtrip_take_ext_types(tmp_path: Path):
     ]
 
 
-def test_image_arrays(tmp_path: Path):
-    import os
-    from pathlib import Path
-
-    import tensorflow as tf
-
-    n = 10
-    png_uris = [
-        "file://" + os.path.join(os.path.dirname(__file__), "images/1.png"),
-    ] * n
-
+@pytest.fixture
+def png_uris():
+    local_path = "file://" + os.path.join(os.path.dirname(__file__), "images/1.png")
+    png_uris = [local_path] * 10
     if os.name == "nt":
         png_uris = [str(Path(x)) for x in png_uris]
+    return png_uris
 
-    assert ImageArray.from_array(png_uris).to_pylist() == png_uris
-    assert (
-        ImageArray.from_array(pa.array(png_uris, pa.string())).to_pylist() == png_uris
-    )
+
+def test_image_uri_arrays(tmp_path: Path, png_uris):
+    from_list = ImageURIArray.from_uris(png_uris)
+    from_pyarrow = ImageURIArray.from_uris(pa.array(png_uris, pa.string()))
+    from_pyarrow_large = ImageURIArray.from_uris(pa.array(png_uris, pa.large_string()))
+    for arr in [from_list, from_pyarrow, from_pyarrow_large]:
+        assert arr.to_pylist() == png_uris
+
     image_array = ImageURIArray.from_uris(png_uris)
     assert ImageArray.from_array(image_array) == image_array
 
     encoded_image_array = image_array.read_uris()
-    assert len(ImageArray.from_array(encoded_image_array.storage)) == n
+    assert len(ImageArray.from_array(encoded_image_array.storage)) == 10
     assert ImageArray.from_array(encoded_image_array) == encoded_image_array
+
+    large_array = encoded_image_array.storage.cast(pa.large_binary())
+    large_array = ImageArray.from_array(large_array)
+    assert large_array.to_pylist() == encoded_image_array.to_pylist()
+
+
+def test_image_tensor_arrays(tmp_path: Path, png_uris):
+    tf = pytest.importorskip("tensorflow")
+
+    n = 10
+
+    encoded_image_array = ImageURIArray.from_uris(png_uris).read_uris()
 
     tensor_image_array = encoded_image_array.to_tensor()
     fixed_shape_tensor_array = pa.ExtensionArray.from_storage(
@@ -306,3 +319,22 @@ def test_roundtrip_image_tensor(tmp_path: Path):
     tensor_image_array_2 = tbl2.take(indices).column(2)
 
     assert tensor_image_array_2.type == tensor_image_array.type
+
+
+def test_image_array_pickle(tmp_path: Path, png_uris):
+    # Note: this test will only fail in PyArrow 12.0.0. It was fixed in 13.0.0.
+    uri_array = ImageURIArray.from_uris(png_uris)
+    encoded_array = uri_array.read_uris()
+    tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(
+        np.random.random((10, 1, 1, 4)).astype(np.uint8)
+    )
+    tensor_array = pa.ExtensionArray.from_storage(
+        FixedShapeImageTensorType(pa.uint8(), tensor_array.type.shape),
+        tensor_array.storage,
+    )
+
+    arrays = [uri_array, encoded_array, tensor_array]
+    for arr in arrays:
+        data = pickle.dumps(arr)
+        arr2 = pickle.loads(data)
+        assert arr == arr2

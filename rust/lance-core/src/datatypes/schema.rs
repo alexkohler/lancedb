@@ -201,12 +201,31 @@ impl Schema {
     /// to distinguish from nested fields.
     // TODO: pub(crate)
     pub fn validate(&self) -> Result<()> {
+        let mut seen_names = HashSet::new();
+
         for field in self.fields.iter() {
             if field.name.contains('.') {
                 return Err(Error::Schema{message:format!(
                     "Top level field {} cannot contain `.`. Maybe you meant to create a struct field?",
                     field.name.clone()
                 ), location: location!(),});
+            }
+
+            let column_path = self
+                .field_ancestry_by_id(field.id)
+                .unwrap()
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if !seen_names.insert(column_path.clone()) {
+                return Err(Error::Schema {
+                    message: format!(
+                        "Duplicate field name \"{}\" in schema:\n {:#?}",
+                        column_path, self
+                    ),
+                    location: location!(),
+                });
             }
         }
 
@@ -254,7 +273,7 @@ impl Schema {
         let filtered_fields = self
             .fields
             .iter()
-            .filter_map(|f| f.project_by_filter(&|f| column_ids.contains(&f.id)))
+            .filter_map(|f| f.project_by_ids(column_ids))
             .collect();
         Self {
             fields: filtered_fields,
@@ -586,7 +605,7 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let projected = schema.project_by_ids(&[1, 2, 4, 5]);
+        let projected = schema.project_by_ids(&[2, 4, 5]);
 
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
@@ -609,6 +628,18 @@ mod tests {
                 DataType::Utf8,
                 true,
             )])),
+            true,
+        )]);
+        assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+
+        let projected = schema.project_by_ids(&[1]);
+        let expected_arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("f1", DataType::Utf8, true),
+                ArrowField::new("f2", DataType::Boolean, false),
+                ArrowField::new("f3", DataType::Float32, false),
+            ])),
             true,
         )]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);

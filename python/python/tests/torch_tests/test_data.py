@@ -87,6 +87,52 @@ def test_iter_over_dataset(tmp_path):
     assert total_rows == 4096
 
 
+def test_iter_filter(tmp_path):
+    arr = pa.array(range(1000))
+    tbl = pa.Table.from_arrays([arr], ["ids"])
+
+    ds = lance.write_dataset(tbl, tmp_path / "data.lance", max_rows_per_group=32)
+
+    def check(dataset):
+        total_rows = 0
+        for batch in dataset:
+            assert torch.where(batch >= 300, True, False).all()
+            total_rows += batch.size(dim=0)
+            assert batch.dtype == torch.int64
+        assert total_rows == 700
+
+    # No shard_grandularity
+    check(
+        LanceDataset(
+            ds,
+            batch_size=10,
+            filter="ids >= 300",
+            columns=["ids"],
+        )
+    )
+
+    # shard_grandularity fragment ok
+    check(
+        LanceDataset(
+            ds,
+            batch_size=10,
+            filter="ids >= 300",
+            columns=["ids"],
+            sampler=ShardedFragmentSampler(0, 1),
+        )
+    )
+
+    # sampling fails
+    with pytest.raises(ValueError):
+        LanceDataset(
+            ds,
+            batch_size=10,
+            filter="ids >= 300",
+            samples=100,
+            columns=["ids"],
+        )
+
+
 def test_sharded_torch_dataset(tmp_path):
     arr = pa.array(range(1000))
     tbl = pa.Table.from_arrays([arr], ["ids"])
@@ -150,3 +196,51 @@ def test_sample_batches(tmp_path: Path):
 
     all_ids = list(chain.from_iterable([batch.cpu().numpy() for batch in ds]))
     assert all_ids == [i for i in range(2000) if i // 25 % 2 == 1]
+
+
+def test_sample_batches_with_filter(tmp_path: Path):
+    NUM_ROWS = 10000
+    tbl = pa.Table.from_pydict({
+        "id": range(NUM_ROWS),
+        "filterme": [i % 2 for i in range(NUM_ROWS)],
+    })
+
+    lance.write_dataset(tbl, tmp_path, max_rows_per_file=2000)
+
+    ds = LanceDataset(
+        tmp_path,
+        batch_size=25,
+        columns=["id"],
+        with_row_id=True,
+        filter="filterme == 0",
+        sampler=ShardedBatchSampler(rank=3, world_size=5),
+    )
+
+    # The filtered sequence is 0, 2, 4, ...
+    #
+    # With rank 3 and world size 5 we should get
+    #
+    # - - - 6  -
+    # - - - 16 -
+    # - - - 26 -
+    # ...
+    all_ids = list(chain.from_iterable([batch.cpu().numpy() for batch in ds]))
+    # Half of the data is filtered out, divided amongst 5 workers s
+    # each should see 1/10th of the data
+    assert len(all_ids) == 1000
+    assert all_ids == [6 + (10 * i) for i in range(len(all_ids))]
+
+    # Now test with random order
+    ds = LanceDataset(
+        tmp_path,
+        batch_size=25,
+        columns=["id"],
+        with_row_id=True,
+        filter="filterme == 0",
+        sampler=ShardedBatchSampler(rank=3, world_size=5, randomize=True),
+    )
+
+    randomized_ids = list(chain.from_iterable([batch.cpu().numpy() for batch in ds]))
+    assert randomized_ids != all_ids
+    randomized_ids.sort()
+    assert randomized_ids == all_ids

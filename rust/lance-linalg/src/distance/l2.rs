@@ -27,10 +27,10 @@ use arrow_array::{
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatArray, FloatToArrayType};
+#[cfg(feature = "fp16kernels")]
+use lance_core::utils::cpu::SimdSupport;
+use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 use num_traits::{AsPrimitive, Float};
-
-#[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
-use lance_core::utils::cpu::x86::AVX512_F16_SUPPORTED;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -38,9 +38,11 @@ use crate::simd::{
 };
 use crate::{Error, Result};
 
+use super::Normalize;
+
 /// Calculate the L2 distance between two vectors.
 ///
-pub trait L2: ArrowFloatType {
+pub trait L2: ArrowFloatType + Normalize {
     /// Calculate the L2 distance between two vectors.
     fn l2(x: &[Self::Native], y: &[Self::Native]) -> f32;
 
@@ -67,10 +69,14 @@ where
 ///
 /// This is pub for test/benchmark only. use [l2] instead.
 #[inline]
-pub fn l2_scalar<T: Float + Sum + AddAssign + AsPrimitive<f32>, const LANES: usize>(
+pub fn l2_scalar<
+    T: AsPrimitive<Output>,
+    Output: Float + Sum + AddAssign + 'static,
+    const LANES: usize,
+>(
     from: &[T],
     to: &[T],
-) -> f32 {
+) -> Output {
     let x_chunks = from.chunks_exact(LANES);
     let y_chunks = to.chunks_exact(LANES);
 
@@ -80,64 +86,70 @@ pub fn l2_scalar<T: Float + Sum + AddAssign + AsPrimitive<f32>, const LANES: usi
             .iter()
             .zip(y_chunks.remainder())
             .map(|(&x, &y)| {
-                let diff = x - y;
+                let diff = x.as_() - y.as_();
                 diff * diff
             })
-            .sum()
+            .sum::<Output>()
     } else {
-        T::zero()
+        Output::zero()
     };
 
-    let mut sums = [T::zero(); LANES];
+    let mut sums = [Output::zero(); LANES];
     for (x, y) in x_chunks.zip(y_chunks) {
         for i in 0..LANES {
-            let diff = x[i] - y[i];
+            let diff = x[i].as_() - y[i].as_();
             sums[i] += diff * diff;
         }
     }
 
-    (s + sums.iter().copied().sum()).as_()
+    s + sums.iter().copied().sum()
 }
 
 impl L2 for BFloat16Type {
     #[inline]
     fn l2(x: &[bf16], y: &[bf16]) -> f32 {
         // TODO: add SIMD support
-        l2_scalar::<bf16, 16>(x, y)
+        l2_scalar::<bf16, f32, 16>(x, y)
     }
 }
 
-#[cfg(any(
-    all(target_os = "macos", target_feature = "neon"),
-    all(target_os = "linux", feature = "avx512fp16")
-))]
+#[cfg(feature = "fp16kernels")]
 mod kernel {
     use super::*;
 
+    // These are the `l2_f16` function in f16.c. Our build.rs script compiles
+    // a version of this file for each SIMD level with different suffixes.
     extern "C" {
-        pub fn l2_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "aarch64")]
+        pub fn l2_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(all(kernel_suppport = "avx512", target_arch = "x86_64"))]
+        pub fn l2_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn l2_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
     }
 }
 
 impl L2 for Float16Type {
     #[inline]
     fn l2(x: &[f16], y: &[f16]) -> f32 {
-        #[cfg(all(target_os = "macos", target_feature = "neon"))]
-        unsafe {
-            kernel::l2_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
-        }
-        #[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
-        if *AVX512_F16_SUPPORTED {
-            unsafe { kernel::l2_f16(x.as_ptr(), y.as_ptr(), x.len() as u32) }
-        } else {
-            l2_scalar::<f16, 16>(x, y)
-        }
-        #[cfg(not(any(
-            all(target_os = "macos", target_feature = "neon"),
-            all(target_os = "linux", feature = "avx512fp16")
-        )))]
-        {
-            l2_scalar::<f16, 16>(x, y)
+        match *FP16_SIMD_SUPPORT {
+            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+            SimdSupport::Neon => unsafe {
+                kernel::l2_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(
+                feature = "fp16kernels",
+                kernel_suppport = "avx512",
+                target_arch = "x86_64"
+            ))]
+            SimdSupport::Avx512 => unsafe {
+                kernel::l2_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
+            SimdSupport::Avx2 => unsafe {
+                kernel::l2_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            _ => l2_scalar::<f16, f32, 16>(x, y),
         }
     }
 }
@@ -145,7 +157,7 @@ impl L2 for Float16Type {
 impl L2 for Float32Type {
     #[inline]
     fn l2(x: &[f32], y: &[f32]) -> f32 {
-        l2_scalar::<f32, 32>(x, y)
+        l2_scalar::<f32, f32, 32>(x, y)
     }
 
     fn l2_batch<'a>(
@@ -173,7 +185,8 @@ impl L2 for Float64Type {
     #[inline]
     fn l2(x: &[f64], y: &[f64]) -> f32 {
         // TODO: add SIMD support
-        l2_scalar::<f64, 8>(x, y)
+        // TODO: should we let this return f64 to avoid overflow?
+        l2_scalar::<f64, f64, 8>(x, y) as f32
     }
 }
 
@@ -281,6 +294,11 @@ mod tests {
 
     use approx::assert_relative_eq;
     use arrow_array::Float32Array;
+    use proptest::prelude::*;
+
+    use crate::test_utils::{
+        arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
+    };
 
     #[test]
     fn test_euclidean_distance() {
@@ -377,5 +395,62 @@ mod tests {
 
         let d = l2_distance_batch(q.values(), values.values(), 32).collect::<Vec<_>>();
         assert_relative_eq!(0.319_357_84, d[0]);
+    }
+
+    /// Reference implementation of L2 distance.
+    ///
+    /// Note that we skip the final square root step for performance reasons.
+    fn l2_distance_reference(x: &[f64], y: &[f64]) -> f64 {
+        x.iter()
+            .zip(y.iter())
+            .map(|(x, y)| (*x - *y).powi(2))
+            .sum::<f64>()
+    }
+
+    fn do_l2_test<T: FloatToArrayType>(x: &[T], y: &[T]) -> std::result::Result<(), TestCaseError>
+    where
+        T::ArrowType: L2,
+    {
+        let x_f64 = x.iter().map(|v| v.to_f64().unwrap()).collect::<Vec<f64>>();
+        let y_f64 = y.iter().map(|v| v.to_f64().unwrap()).collect::<Vec<f64>>();
+
+        let result = l2(x, y);
+        let reference = l2_distance_reference(&x_f64, &y_f64) as f32;
+
+        prop_assert!(approx::relative_eq!(result, reference, max_relative = 1e-6));
+        Ok(())
+    }
+
+    #[test]
+    fn test_l2_distance_f16_max() {
+        let x = vec![f16::MAX; 4048];
+        let y = vec![-f16::MAX; 4048];
+        do_l2_test(&x, &y).unwrap();
+    }
+
+    // Test L2 distance over different types.
+    // * L2 is valid over the entire range of f16.
+    // * L2 is valid over f32 and bf16 in the range of +-1e12.
+    // * L2 for f64 should match the reference implementation.
+    proptest::proptest! {
+        #[test]
+        fn test_l2_distance_f16((x, y) in arbitrary_vector_pair(arbitrary_f16, 4..4048)) {
+            do_l2_test(&x, &y)?;
+        }
+
+        #[test]
+        fn test_l2_distance_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
+            do_l2_test(&x, &y)?;
+        }
+
+        #[test]
+        fn test_l2_distance_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
+            do_l2_test(&x, &y)?;
+        }
+
+        #[test]
+        fn test_l2_distance_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
+            do_l2_test(&x, &y)?;
+        }
     }
 }

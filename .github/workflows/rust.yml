@@ -28,13 +28,17 @@ env:
 
 jobs:
   linux-build:
-    runs-on:
-      group: large-runners
-      labels: ubuntu-22.04-4core
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
-    defaults:
-      run:
-        working-directory: ./rust
+    strategy:
+      matrix:
+        toolchain:
+          - stable
+          - nightly
+    env:
+      # Need up-to-date compilers for kernels
+      CC: gcc-12
+      CXX: g++-12
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -44,6 +48,8 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
+          rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
+          rustup component add rustfmt
       - name: Run cargo fmt
         run: cargo fmt --check
       # split everything us so we know what's slow.
@@ -51,19 +57,23 @@ jobs:
         run: |
           cargo build --all-features --tests
       - name: Start DynamoDB local for tests
+        if: ${{ matrix.toolchain == 'stable' }}
         run: |
           docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
       - name: Run tests
+        if: ${{ matrix.toolchain == 'stable' }}
         run: |
           cargo test --features dynamodb,tensorflow,dynamodb_tests,cli
+      - name: Run tests (nightly)
+        if: ${{ matrix.toolchain != 'stable' }}
+        run: |
+          cargo test
       - name: Build benchmarks
+        if: ${{ matrix.toolchain == 'stable' }}
         run: cargo build --benches
   linux-arm:
     runs-on: buildjet-4vcpu-ubuntu-2204-arm
     timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: ./rust
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -78,13 +88,10 @@ jobs:
         run: cargo fmt --check
       - name: Run tests
         run: |
-          cargo test -- --test-threads 1
+          cargo test --all-features -- --test-threads 1
   clippy:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: ./rust
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -99,18 +106,25 @@ jobs:
   mac-build:
     runs-on: "macos-14"
     timeout-minutes: 45
+    strategy:
+      matrix:
+        toolchain:
+          - stable
+          - nightly
     defaults:
       run:
         working-directory: ./rust/lance
     steps:
       - uses: actions/checkout@v4
-      - name: CPU features
-        run: sysctl -a | grep cpu
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
       - name: Install dependencies
         run: brew install protobuf
+      - name: Set up Rust
+        run: |
+          rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
+          rustup component add rustfmt
       - name: Run tests
         run: |
           cargo build --all-features

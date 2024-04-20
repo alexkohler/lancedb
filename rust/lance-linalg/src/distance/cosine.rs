@@ -26,12 +26,16 @@ use arrow_array::{
     Array, FixedSizeListArray, Float32Array,
 };
 use arrow_schema::DataType;
+use half::f16;
 use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
+#[cfg(feature = "fp16kernels")]
+use lance_core::utils::cpu::SimdSupport;
+use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 use num_traits::{AsPrimitive, FromPrimitive};
 
-use super::dot::dot;
 use super::norm_l2::norm_l2;
+use super::{dot::dot, Normalize};
 use crate::simd::{
     f32::{f32x16, f32x8},
     FloatSimd, SIMD,
@@ -39,7 +43,7 @@ use crate::simd::{
 use crate::{Error, Result};
 
 /// Cosine Distance
-pub trait Cosine: super::dot::Dot
+pub trait Cosine: super::dot::Dot + Normalize
 where
     Self::Native: AsPrimitive<f64> + AsPrimitive<f32>,
     <Self::Native as FloatToArrayType>::ArrowType: Cosine + super::dot::Dot,
@@ -89,7 +93,45 @@ where
 
 impl Cosine for BFloat16Type {}
 
-impl Cosine for Float16Type {}
+#[cfg(feature = "fp16kernels")]
+mod kernel {
+    use super::*;
+
+    // These are the `cosine_f16` function in f16.c. Our build.rs script compiles
+    // a version of this file for each SIMD level with different suffixes.
+    extern "C" {
+        #[cfg(target_arch = "aarch64")]
+        pub fn cosine_f16_neon(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
+        #[cfg(all(kernel_suppport = "avx512", target_arch = "x86_64"))]
+        pub fn cosine_f16_avx512(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn cosine_f16_avx2(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
+    }
+}
+
+impl Cosine for Float16Type {
+    fn cosine_fast(x: &[f16], x_norm: f32, y: &[f16]) -> f32 {
+        match *FP16_SIMD_SUPPORT {
+            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+            SimdSupport::Neon => unsafe {
+                kernel::cosine_f16_neon(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            #[cfg(all(
+                feature = "fp16kernels",
+                kernel_suppport = "avx512",
+                target_arch = "x86_64"
+            ))]
+            SimdSupport::Avx512 => unsafe {
+                kernel::cosine_f16_avx512(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
+            SimdSupport::Avx2 => unsafe {
+                kernel::cosine_f16_avx2(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            _ => cosine_scalar(x, x_norm, y),
+        }
+    }
+}
 
 /// f32 kernels for Cosine
 mod f32 {
@@ -319,8 +361,12 @@ pub fn cosine_distance_arrow_batch(
 mod tests {
     use super::*;
 
+    use crate::test_utils::{
+        arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
+    };
     use approx::assert_relative_eq;
     use arrow_array::Float32Array;
+    use proptest::prelude::*;
 
     fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
         let xy = x
@@ -364,5 +410,77 @@ mod tests {
         let d = cosine_distance_batch(x.values(), y.values(), 2).collect::<Vec<_>>();
         assert_relative_eq!(d[0], 0.0);
         assert_relative_eq!(d[0], 0.0);
+    }
+
+    /// Reference implementation of cosine distance, plus error propagation.
+    ///
+    /// Pass `rel_err` to provide the allowed relative error in the dot product
+    /// results. This function will then compute the expected absolute error.
+    fn cosine_ref(x: &[f64], y: &[f64], rel_err: f64) -> (f32, f32) {
+        let xy = x
+            .iter()
+            .zip(y.iter())
+            .map(|(&xi, &yi)| xi * yi)
+            .sum::<f64>();
+        let x_sq = x.iter().map(|&xi| xi * xi).sum::<f64>().sqrt();
+        let y_sq = y.iter().map(|&yi| yi * yi).sum::<f64>().sqrt();
+        let expected = (1.0 - xy / x_sq / y_sq) as f32;
+
+        let factor = 1.0 + rel_err;
+        let low = (1.0 - (xy * factor) / (x_sq / factor) / (y_sq / factor)) as f32;
+        let high = (1.0 - (xy / factor) / (x_sq * factor) / (y_sq * factor)) as f32;
+        let low = (expected - low).abs();
+        let high = (expected - high).abs();
+        let error = low.max(high);
+
+        (expected, error)
+    }
+
+    fn do_cosine_test<T: FloatToArrayType>(
+        x: &[T],
+        y: &[T],
+    ) -> std::result::Result<(), TestCaseError>
+    where
+        T::ArrowType: Cosine,
+    {
+        let x_f64 = x.iter().map(|&v| v.as_()).collect::<Vec<_>>();
+        let y_f64 = y.iter().map(|&v| v.as_()).collect::<Vec<_>>();
+
+        let (expected, max_error) = cosine_ref(&x_f64, &y_f64, 1e-6);
+        let result = T::ArrowType::cosine(x, y);
+
+        prop_assert!(approx::relative_eq!(result, expected, epsilon = max_error));
+        Ok(())
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_cosine_f16((x, y) in arbitrary_vector_pair(arbitrary_f16, 4..4048)) {
+            // Cosine requires non-zero vectors
+            prop_assume!(norm_l2(&x) > 1e-6);
+            prop_assume!(norm_l2(&y) > 1e-6);
+            do_cosine_test(&x, &y)?;
+        }
+
+        #[test]
+        fn test_cosine_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
+            prop_assume!(norm_l2(&x) > 1e-6);
+            prop_assume!(norm_l2(&y) > 1e-6);
+            do_cosine_test(&x, &y)?;
+        }
+
+        #[test]
+        fn test_cosine_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
+            prop_assume!(norm_l2(&x) > 1e-10);
+            prop_assume!(norm_l2(&y) > 1e-10);
+            do_cosine_test(&x, &y)?;
+        }
+
+        #[test]
+        fn test_cosine_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
+            prop_assume!(norm_l2(&x) > 1e-20);
+            prop_assume!(norm_l2(&y) > 1e-20);
+            do_cosine_test(&x, &y)?;
+        }
     }
 }
