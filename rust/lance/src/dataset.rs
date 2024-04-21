@@ -957,6 +957,9 @@ impl Dataset {
             let schema = Arc::new(projection.into());
             return Ok(RecordBatch::new_empty(schema));
         }
+        println("!!! take called");
+        println(num_cpus::get());
+        println("take call complete");
 
         let mut sorted_indices: Vec<usize> = (0..row_indices.len()).collect();
         sorted_indices.sort_by_key(|&i| row_indices[i]);
